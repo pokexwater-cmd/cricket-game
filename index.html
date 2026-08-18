@@ -1,0 +1,2486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>3D Walk Controller</title>
+<style>
+  html, body { margin:0; padding:0; overflow:hidden; width:100%; height:100%; background:#111; font-family: -apple-system, sans-serif; }
+  canvas { display:block; }
+
+  #hint {
+    position:absolute; bottom:12px; left:12px;
+    color:#fff; background:rgba(0,0,0,0.5); padding:4px 8px; border-radius:6px;
+    font-size:9px; text-align:left; pointer-events:none; z-index:10;
+    transition: opacity 0.4s; max-width:200px; line-height:1.2;
+  }
+
+  /* Mobile joystick (movement) */
+  #joyZone {
+    position:absolute; left:0; bottom:0; width:45vw; height:45vh;
+    z-index:5; touch-action:none;
+  }
+  #joyBase {
+    position:absolute; width:100px; height:100px; border-radius:50%;
+    background:rgba(255,255,255,0.15); border:2px solid rgba(255,255,255,0.4);
+    display:none; pointer-events:none;
+  }
+  #joyStick {
+    position:absolute; width:46px; height:46px; border-radius:50%;
+    background:rgba(255,255,255,0.6); pointer-events:none;
+  }
+
+  /* Mobile look zone (right half) */
+  #lookZone {
+    position:absolute; right:0; bottom:0; width:55vw; height:100vh;
+    z-index:4; touch-action:none;
+  }
+
+  #mobileControls { display:none; }
+  .isTouch #mobileControls { display:block; }
+  .isTouch #hint { display:none; }
+
+  /* Settings button + panel */
+  #settingsBtn {
+    position:absolute; top:12px; right:12px; z-index:30;
+    width:42px; height:42px; border-radius:50%;
+    background:rgba(0,0,0,0.55); border:1px solid rgba(255,255,255,0.25);
+    color:#fff; font-size:20px; display:flex; align-items:center; justify-content:center;
+    cursor:pointer; user-select:none;
+  }
+  #settingsPanel {
+    position:absolute; top:0; right:0; z-index:40;
+    width:260px; max-width:80vw; height:100%;
+    background:rgba(20,20,25,0.95); color:#fff;
+    box-shadow:-4px 0 20px rgba(0,0,0,0.4);
+    transform:translateX(100%); transition:transform 0.25s ease;
+    padding:16px; box-sizing:border-box; font-size:14px;
+  }
+  #settingsPanel.open { transform:translateX(0); }
+  #settingsPanel h3 { margin:6px 0 18px 0; font-size:16px; }
+  #settingsPanel label { display:block; margin-bottom:6px; opacity:0.85; }
+  #settingsPanel .row { margin-bottom:22px; }
+  #settingsPanel input[type=range] { width:100%; }
+  #sensValue { opacity:0.7; }
+  #backBtn {
+    display:flex; align-items:center; gap:8px;
+    background:rgba(255,255,255,0.1); border:1px solid rgba(255,255,255,0.2);
+    color:#fff; padding:8px 12px; border-radius:8px; cursor:pointer;
+    width:100%; font-size:14px; margin-bottom:20px;
+  }
+  #backBtn:active { background:rgba(255,255,255,0.2); }
+  
+  /* Hide FBX test HUD */
+  #fbxTestHud, [id*="fbx"], [id*="FBX"], [class*="fbx"], [class*="FBX"] { display:none !important; }
+</style>
+</head>
+<body>
+
+<div id="hint">Click: look • WASD: move • Shift: run • R: reset • Esc: release</div>
+
+<div id="settingsBtn">&#9881;</div>
+<div id="settingsPanel">
+  <button id="backBtn">&#8592; Back</button>
+  <h3>Settings</h3>
+  <div class="row">
+    <label>Look sensitivity <span id="sensValue">1.0</span></label>
+    <input type="range" id="sensSlider" min="0.1" max="3" step="0.1" value="1">
+  </div>
+  <!-- more settings will go here later -->
+</div>
+
+<div id="mobileControls">
+  <div id="joyZone">
+    <div id="joyBase"></div>
+    <div id="joyStick"></div>
+  </div>
+  <div id="lookZone"></div>
+</div>
+
+<script>
+// Suppress all console output — send messages to the void instead of dev tools
+(function() {
+  const noop = () => {};
+  window.console = { log: noop, warn: noop, error: noop, info: noop, debug: noop };
+})();
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ---------- Setup ----------
+let isTouch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0 ||
+  (window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+if (isTouch) document.body.classList.add('isTouch');
+
+// Fallback: some in-app webviews report no touch support at load time even
+// though the device is touch-only. If a real touch ever happens, switch to
+// touch controls immediately so the player is never stuck with no input.
+window.addEventListener('touchstart', () => {
+  if (!isTouch) {
+    isTouch = true;
+    document.body.classList.add('isTouch');
+  }
+}, { passive: true });
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x8fbfe0);
+scene.fog = new THREE.Fog(0x8fbfe0, 60, 400);
+
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.1, 1000);
+const EYE_HEIGHT = 1.7;
+camera.position.set(0, EYE_HEIGHT, 35);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, isTouch ? 1.5 : 2));
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ---------- Lighting ----------
+scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+const hemi = new THREE.HemisphereLight(0xbfe3ff, 0x3a5a2f, 0.9);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+sun.position.set(80, 120, 40);
+sun.castShadow = true;
+sun.shadow.mapSize.set(isTouch ? 1024 : 2048, isTouch ? 1024 : 2048);
+sun.shadow.camera.left = -150;
+sun.shadow.camera.right = 150;
+sun.shadow.camera.top = 150;
+sun.shadow.camera.bottom = -150;
+sun.shadow.camera.far = 400;
+scene.add(sun);
+
+// ---------- Cricket Stadium Environment ----------
+let WORLD_SIZE = 500;          // grass world size, used later by the movement clamp
+let lookSensitivity = 1.0;     // used later by mouse/touch look handlers
+let updateCharacterBillboards = function () {}; // replaced below if character setup succeeds
+let PITCH_LEN = 20.1;           // ~22 yards; hoisted so code after the try block can use it
+let PITCH_WID = 3.05;           // 10 ft; hoisted for the same reason
+
+// Stadium and collision constants - hoisted so they can be used everywhere
+let STADIUM_EDGE_R = 113;      // outer edge of the stadium seating bowl, used to hard-stop a big lofted six; refined below once the stands are actually built
+let STAND_START_R = 76;        // inner radius where the sloped seating bowl begins (outfield ends, stands start); refined below once the stands are actually built
+let STAND_PROFILE = [];        // (radius, height) points tracing the seating bowl's sloped surface, used so the ball actually lands/bounces ON TOP of the stands instead of clipping through them; populated below once the stands are built
+let STADIUM_WALL_R = 72.5;     // radius of the low blue advertising-board ring — solid to the player, so walking around the outfield stops here instead of clipping through the boards into the seating bowl; refined below once OUTFIELD_R is known
+
+// Dugout collision constants
+let DUGOUT_MIN_X = 71, DUGOUT_MAX_X = 75.4;
+let DUGOUT_MIN_Z = -5.5, DUGOUT_MAX_Z = 5.5;
+let PLAYER_DUGOUT_X = 0, PLAYER_DUGOUT_Z = 0;
+let DUGOUT_PLAYER_NOOK_MIN_Z = 0.3;
+let DUGOUT_ROOF_Y = 2.5;
+const PLAYER_COLLISION_RADIUS = 0.4;
+let DUGOUT_SEAT_POSITIONS = [];
+
+// Collision functions
+function resolveDugoutCollision(pos) {
+  if (pos.x < DUGOUT_MIN_X || pos.x > DUGOUT_MAX_X) return;
+  if (pos.z >= DUGOUT_PLAYER_NOOK_MIN_Z) return; // allow standing in positive-Z half
+  const cz = Math.max(DUGOUT_MIN_Z, Math.min(pos.z, DUGOUT_MAX_Z));
+  const closest_z = Math.abs(pos.z - DUGOUT_MIN_Z) < Math.abs(pos.z - DUGOUT_MAX_Z) ? DUGOUT_MIN_Z : DUGOUT_MAX_Z;
+  pos.z = closest_z + Math.sign(pos.z - closest_z) * PLAYER_COLLISION_RADIUS;
+}
+
+function resolvePlayerStadiumWallCollision(pos, radius) {
+  const dx = pos.x, dz = pos.z;
+  const dist = Math.hypot(dx, dz);
+  const maxR = STADIUM_WALL_R - radius;
+  if (dist <= maxR || dist < 0.0001) return;
+  const scale = maxR / dist;
+  pos.x = dx * scale;
+  pos.z = dz * scale;
+}
+
+function groundHeightAt(x, z) {
+  const r = Math.hypot(x, z);
+  if (r <= STAND_START_R || STAND_PROFILE.length < 2) return 0;
+  const last = STAND_PROFILE[STAND_PROFILE.length - 1];
+  if (r >= last.x) return last.y;
+  for (let i = 0; i < STAND_PROFILE.length - 1; i++) {
+    const p0 = STAND_PROFILE[i], p1 = STAND_PROFILE[i + 1];
+    if (r >= p0.x && r <= p1.x) {
+      const t = (r - p0.x) / (p1.x - p0.x);
+      return p0.y + t * (p1.y - p0.y);
+    }
+  }
+  return last.y;
+}
+
+try {
+const OUTFIELD_R   = 70;   // radius of the grass playing area
+const BOUNDARY_R   = 68;   // white boundary rope
+WORLD_SIZE = 500;  // grass extends out beneath the stands too
+
+// Base grass texture (used for outfield + surrounding grass)
+function makeGrassTexture() {
+  const size = 512;
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#4c9a4c';
+  ctx.fillRect(0, 0, size, size);
+  for (let i = 0; i < 4000; i++) {
+    ctx.fillStyle = Math.random() > 0.5 ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.04)';
+    ctx.fillRect(Math.random()*size, Math.random()*size, 2, 2);
+  }
+  // faint mow-stripe rings
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+  ctx.lineWidth = 14;
+  for (let r = 20; r < size; r += 40) {
+    ctx.beginPath(); ctx.arc(size/2, size/2, r, 0, Math.PI*2); ctx.stroke();
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  return tex;
+}
+const grassTexBase = makeGrassTexture();
+
+// Surrounding grass (under stands / beyond stadium, so no void)
+const outerGrassTex = grassTexBase.clone();
+outerGrassTex.needsUpdate = true;
+outerGrassTex.repeat.set(60, 60);
+const outerGrass = new THREE.Mesh(
+  new THREE.PlaneGeometry(WORLD_SIZE, WORLD_SIZE),
+  new THREE.MeshStandardMaterial({ map: outerGrassTex, roughness: 1, color: 0x336633 })
+);
+outerGrass.rotation.x = -Math.PI/2;
+outerGrass.position.y = -0.05;
+outerGrass.receiveShadow = true;
+scene.add(outerGrass);
+
+// Outfield (circular playing area)
+const outfieldTex = grassTexBase.clone();
+outfieldTex.needsUpdate = true;
+outfieldTex.repeat.set(10, 10);
+const outfield = new THREE.Mesh(
+  new THREE.CircleGeometry(OUTFIELD_R, 96),
+  new THREE.MeshStandardMaterial({ map: outfieldTex, roughness: 1 })
+);
+outfield.rotation.x = -Math.PI/2;
+outfield.receiveShadow = true;
+scene.add(outfield);
+
+// The "square" — mown lighter patch around the pitch
+const squareMat = new THREE.MeshStandardMaterial({ color: 0x6ab04c, roughness: 1 });
+const square = new THREE.Mesh(new THREE.CircleGeometry(16, 48), squareMat);
+square.rotation.x = -Math.PI/2;
+square.position.y = 0.005;
+square.receiveShadow = true;
+scene.add(square);
+
+// Pitch strip
+const pitchMat = new THREE.MeshStandardMaterial({ color: 0xC2A878, roughness: 0.95 });
+const pitchMesh = new THREE.Mesh(new THREE.PlaneGeometry(PITCH_WID, PITCH_LEN), pitchMat);
+pitchMesh.rotation.x = -Math.PI/2;
+pitchMesh.position.y = 0.01;
+pitchMesh.receiveShadow = true;
+scene.add(pitchMesh);
+
+// Helper for thin white line meshes
+const lineMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+function addLine(w, d, x, z, y = 0.02, rotY = 0) {
+  const line = new THREE.Mesh(new THREE.PlaneGeometry(w, d), lineMat);
+  line.rotation.x = -Math.PI/2;
+  line.rotation.z = rotY;
+  line.position.set(x, y, z);
+  scene.add(line);
+  return line;
+}
+
+// Crease markings at both ends of the pitch
+const stumpsZ = PITCH_LEN/2 - 1.2; // stumps set slightly in from pitch edge
+[1, -1].forEach(sign => {
+  const z = sign * stumpsZ;
+  // bowling crease (at the stumps, along width)
+  addLine(2.64, 0.06, 0, z);
+  // popping crease, 1.22m in front of the stumps
+  addLine(3.66, 0.06, 0, z - sign*1.22);
+  // return creases (short lines perpendicular, either side)
+  const rc = new THREE.Mesh(new THREE.PlaneGeometry(0.06, 2.44), lineMat);
+  rc.rotation.x = -Math.PI/2;
+  rc.position.set(1.32, 0.02, z - sign*1.22 + sign*1.22);
+  scene.add(rc);
+  const rc2 = rc.clone();
+  rc2.position.x = -1.32;
+  scene.add(rc2);
+
+  // Stumps (3 little cylinders) at each end
+  for (let s = -1; s <= 1; s++) {
+    const stump = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.02, 0.02, 0.28, 8),
+      new THREE.MeshStandardMaterial({ color: 0xe8d9b0 })
+    );
+    stump.position.set(s * 0.1, 0.14, z);
+    stump.castShadow = true;
+    scene.add(stump);
+  }
+});
+
+// Boundary rope (white circle)
+{
+  const pts = [];
+  const segs = 128;
+  for (let i = 0; i <= segs; i++) {
+    const a = (i/segs) * Math.PI * 2;
+    pts.push(new THREE.Vector3(Math.cos(a)*BOUNDARY_R, 0.03, Math.sin(a)*BOUNDARY_R));
+  }
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  const boundary = new THREE.LineLoop(geo, new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 3 }));
+  scene.add(boundary);
+}
+
+// Low advertising boards ring, just outside the boundary
+{
+  const boardR = OUTFIELD_R + 2.5;
+  STADIUM_WALL_R = boardR; // now that OUTFIELD_R is known, lock the player-collision wall to the board's actual radius
+  const boardMat = new THREE.MeshStandardMaterial({ color: 0x1e5fa8, side: THREE.DoubleSide });
+  const boardGeo = new THREE.CylinderGeometry(boardR, boardR, 1.1, 96, 1, true);
+  const boards = new THREE.Mesh(boardGeo, boardMat);
+  boards.position.y = 0.55;
+  boards.receiveShadow = true;
+  scene.add(boards);
+}
+
+// ---------- Round tiered stadium seating (textured bowl) ----------
+let topR, topY;
+{
+  // Build a seat-pattern texture: a grid of individually colored "seats"
+  function makeSeatTexture() {
+    const cell = 32, cols = 8, rows = 8;
+    const size = cell * cols;
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#20242b';
+    ctx.fillRect(0, 0, size, size);
+    const palette = ['#d94f4f', '#e07b39', '#f2c14e', '#4f8fd9', '#3fae7a', '#9a4fd9', '#d94fb0', '#4fd9d0'];
+    for (let r = 0; r < rows; r++) {
+      const color = palette[r % palette.length];
+      for (let cIdx = 0; cIdx < cols; cIdx++) {
+        ctx.fillStyle = color;
+        const pad = 3;
+        ctx.fillRect(cIdx*cell+pad, r*cell+pad, cell-pad*2, cell-pad*2-4);
+        // seat-back shading
+        ctx.fillStyle = 'rgba(0,0,0,0.18)';
+        ctx.fillRect(cIdx*cell+pad, r*cell+pad, cell-pad*2, 5);
+      }
+    }
+    const tex = new THREE.CanvasTexture(c);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    return tex;
+  }
+
+  const startR = OUTFIELD_R + 6;
+  const tiers = 26;
+  const rowHeight = 0.9;
+  const rowDepth = 1.05;
+
+  // Profile of the bowl: starts low near the field, curves up and outward (amphitheater slope)
+  const points = [];
+  for (let t = 0; t <= tiers; t++) {
+    const frac = t / tiers;
+    const r = startR + t * rowDepth + frac*frac * 10; // gentle outward flare as it rises
+    const y = 0.3 + t * rowHeight;
+    points.push(new THREE.Vector2(r, y));
+  }
+  topR = points[points.length-1].x;
+  topY = points[points.length-1].y;
+  STADIUM_EDGE_R = topR - 4; // stop the ball a little before the literal back wall, i.e. right at the crowd
+  STAND_START_R = startR;    // ball physics (groundHeightAt) now uses this to know where the solid seating begins
+  STAND_PROFILE = points;    // ball physics (groundHeightAt) walks this to find the seating surface height at any radius
+
+  const seatTex = makeSeatTexture();
+  seatTex.repeat.set(90, tiers / 2);
+
+  const bowlGeo = new THREE.LatheGeometry(points, 128);
+  const bowlMat = new THREE.MeshStandardMaterial({
+    map: seatTex, roughness: 0.85, metalness: 0,
+    side: THREE.DoubleSide
+  });
+  const bowl = new THREE.Mesh(bowlGeo, bowlMat);
+  bowl.receiveShadow = true;
+  scene.add(bowl);
+
+  // Back wall behind the top row (solid, so it doesn't look open to the sky)
+  const backWallMat = new THREE.MeshStandardMaterial({ color: 0x2b2f38, roughness: 0.9 });
+  const backWall = new THREE.Mesh(
+    new THREE.CylinderGeometry(topR + 0.5, topR + 0.5, 3, 128, 1, true),
+    backWallMat
+  );
+  backWall.position.y = topY + 1.3;
+  scene.add(backWall);
+
+  // Canopy roof ring, tilted outward for a classic stadium silhouette
+  const roofMat = new THREE.MeshStandardMaterial({ color: 0x555b66, roughness: 0.6, metalness: 0.3, side: THREE.DoubleSide });
+  const roofGeo = new THREE.RingGeometry(topR - 2, topR + 14, 128);
+  const roof = new THREE.Mesh(roofGeo, roofMat);
+  roof.rotation.x = Math.PI/2 + 0.18;
+  roof.position.y = topY + 8;
+  scene.add(roof);
+
+  // Support struts under the roof, evenly spaced
+  const strutMat = new THREE.MeshStandardMaterial({ color: 0x444a52 });
+  const strutCount = 24;
+  for (let i = 0; i < strutCount; i++) {
+    const a = (i/strutCount) * Math.PI * 2;
+    const strut = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.15, 8, 6), strutMat);
+    strut.position.set(Math.cos(a)*(topR+2), topY + 4, Math.sin(a)*(topR+2));
+    strut.rotation.z = Math.cos(a) * 0.3;
+    strut.rotation.x = -Math.sin(a) * 0.3;
+    scene.add(strut);
+  }
+}
+
+// ---------- Team dugout: a solid curved-roof shelter just outside the boundary ----------
+{
+  const dugoutDepth = OUTFIELD_R + 2.5;       // front face just outside the ad boards
+  const dugoutHalfLen = 5.5;                  // half the bench's length, along Z
+  const dugoutHalfDepth = 1.6;                // front-to-back depth of the shelter
+  const dugoutCenterX = dugoutDepth + dugoutHalfDepth;
+  DUGOUT_MIN_X = dugoutCenterX - dugoutHalfDepth;
+  DUGOUT_MAX_X = dugoutCenterX + dugoutHalfDepth;
+  DUGOUT_MIN_Z = -dugoutHalfLen;
+  DUGOUT_MAX_Z = dugoutHalfLen;
+
+  const dugout = new THREE.Group();
+
+  // Low white base frame the bench + posts sit on
+  const baseMat = new THREE.MeshStandardMaterial({ color: 0xf2f2f2, roughness: 0.5 });
+  const base = new THREE.Mesh(new THREE.BoxGeometry(dugoutHalfDepth*2, 0.12, dugoutHalfLen*2), baseMat);
+  base.position.set(dugoutCenterX, 0.06, 0);
+  dugout.add(base);
+
+  // Row of bench seats, evenly spaced along the length
+  const seatMat = new THREE.MeshStandardMaterial({ color: 0x1f6fd6, roughness: 0.4 });
+  const seatCount = 10;
+  for (let i = 0; i < seatCount; i++) {
+    const sz = -dugoutHalfLen + 0.5 + i * ((dugoutHalfLen*2 - 1) / (seatCount - 1));
+    const seatPan = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.08, 0.6), seatMat);
+    seatPan.position.set(dugoutCenterX - dugoutHalfDepth + 0.9, 0.55, sz);
+    dugout.add(seatPan);
+    const seatBack = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.55, 0.6), seatMat);
+    seatBack.position.set(dugoutCenterX - dugoutHalfDepth + 0.58, 0.85, sz);
+    dugout.add(seatBack);
+    DUGOUT_SEAT_POSITIONS.push({ x: dugoutCenterX - dugoutHalfDepth + 0.9, y: 0.55, z: sz });
+  }
+
+  // Corner + intermediate posts holding the roof up, white like the frame
+  const postMat = new THREE.MeshStandardMaterial({ color: 0xe8e8e8, roughness: 0.4, metalness: 0.1 });
+  const postCount = 6;
+  for (let i = 0; i < postCount; i++) {
+    const sz = -dugoutHalfLen + i * (dugoutHalfLen*2 / (postCount - 1));
+    [dugoutCenterX - dugoutHalfDepth + 0.15, dugoutCenterX + dugoutHalfDepth - 0.15].forEach((px) => {
+      const post = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 2.3, 8), postMat);
+      post.position.set(px, 1.15, sz);
+      dugout.add(post);
+    });
+  }
+
+  // Curved roof: a barrel-vault arc spanning the shelter's full depth and length, semi-transparent like polycarbonate.
+  const archRadius = dugoutHalfDepth;
+  DUGOUT_ROOF_Y = 2.3 + archRadius;
+  const roofGeo = new THREE.CylinderGeometry(archRadius, archRadius, dugoutHalfLen*2 + 0.4, 24, 1, true, -Math.PI/2, Math.PI);
+  roofGeo.rotateX(-Math.PI/2);
+  const roofMat = new THREE.MeshStandardMaterial({
+    color: 0xdfeeff, roughness: 0.25, metalness: 0.05,
+    transparent: true, opacity: 0.55, side: THREE.DoubleSide
+  });
+  const roof = new THREE.Mesh(roofGeo, roofMat);
+  roof.position.set(dugoutCenterX, 2.3, 0);
+  dugout.add(roof);
+
+  // Solid back wall (the shelter's closed side, facing away from the field)
+  const backWallMat = new THREE.MeshStandardMaterial({ color: 0xe8e8e8, roughness: 0.5, side: THREE.DoubleSide });
+  const backWall = new THREE.Mesh(new THREE.PlaneGeometry(dugoutHalfLen*2, 2.3), backWallMat);
+  backWall.position.set(dugoutCenterX + dugoutHalfDepth - 0.05, 1.15, 0);
+  backWall.rotation.y = Math.PI/2;
+  dugout.add(backWall);
+
+  dugout.traverse((obj) => { if (obj.isMesh) obj.receiveShadow = true; });
+  scene.add(dugout);
+}
+
+// Floodlight towers at 4 corners
+{
+  const towerR = topR + 18;
+  [0.3, 1.3, -0.7, -1.7].forEach(mult => {
+    const a = mult * Math.PI/2 + Math.PI/4;
+    const pole = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.4, 0.5, 34, 8),
+      new THREE.MeshStandardMaterial({ color: 0x888888 })
+    );
+    pole.position.set(Math.cos(a)*towerR, 17, Math.sin(a)*towerR);
+    pole.castShadow = true;
+    scene.add(pole);
+    const lightBank = new THREE.Mesh(
+      new THREE.BoxGeometry(4, 3, 1),
+      new THREE.MeshStandardMaterial({ color: 0xffffee, emissive: 0xffffcc, emissiveIntensity: 0.4 })
+    );
+    lightBank.position.set(Math.cos(a)*towerR, 34, Math.sin(a)*towerR);
+    scene.add(lightBank);
+  });
+}
+
+// ---------- Settings panel ----------
+lookSensitivity = 1.0;
+const settingsBtn = document.getElementById('settingsBtn');
+const settingsPanel = document.getElementById('settingsPanel');
+const backBtn = document.getElementById('backBtn');
+const sensSlider = document.getElementById('sensSlider');
+const sensValue = document.getElementById('sensValue');
+
+function openSettings() {
+  settingsPanel.classList.add('open');
+  if (document.pointerLockElement) document.exitPointerLock();
+}
+function closeSettings() {
+  settingsPanel.classList.remove('open');
+}
+settingsBtn.addEventListener('click', openSettings);
+backBtn.addEventListener('click', closeSettings);
+
+sensSlider.addEventListener('input', () => {
+  lookSensitivity = parseFloat(sensSlider.value);
+  sensValue.textContent = lookSensitivity.toFixed(1);
+});
+
+// Billboard Characters section removed (2D sprite system not needed)
+
+} catch (e) {
+  console.error('Stadium/character setup failed, continuing with controls anyway:', e);
+}
+
+// ---------- Movement state ----------
+const keys = {};
+let yaw = 0, pitch = 0;
+const move = { forward: 0, right: 0 };
+const velocity = new THREE.Vector3();
+const WALK_SPEED = 12;
+const RUN_MULT = 2.0;
+let running = false;
+
+// ---------- Desktop: keyboard ----------
+window.addEventListener('keydown', (e) => {
+  keys[e.code] = true;
+  if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') running = true;
+  // Manual reset: press R to reset delivery after bowler picks up ball
+  if ((e.code === 'KeyR' || e.key.toLowerCase() === 'r') && DUEL.returnComplete && DUEL.state === 'resolved') {
+    resetDelivery();
+  }
+  
+
+});
+window.addEventListener('keyup', (e) => {
+  keys[e.code] = false;
+  if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') running = false;
+});
+
+function updateKeyMove() {
+  move.forward = (keys['KeyW'] || keys['ArrowUp'] ? 1 : 0) - (keys['KeyS'] || keys['ArrowDown'] ? 1 : 0);
+  move.right = (keys['KeyD'] || keys['ArrowRight'] ? 1 : 0) - (keys['KeyA'] || keys['ArrowLeft'] ? 1 : 0);
+}
+
+// ---------- Desktop: pointer lock mouse look ----------
+const hint = document.getElementById('hint');
+renderer.domElement.addEventListener('click', () => {
+  if (!isTouch) renderer.domElement.requestPointerLock();
+});
+document.addEventListener('pointerlockchange', () => {
+  hint.style.opacity = document.pointerLockElement ? '0' : '1';
+});
+document.addEventListener('mousemove', (e) => {
+  if (document.pointerLockElement !== renderer.domElement) return;
+  yaw -= e.movementX * 0.0022 * lookSensitivity;
+  pitch -= e.movementY * 0.0022 * lookSensitivity;
+  pitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, pitch));
+});
+
+// ---------- Mobile: joystick for movement ----------
+const joyZone = document.getElementById('joyZone');
+const joyBase = document.getElementById('joyBase');
+const joyStick = document.getElementById('joyStick');
+let joyTouchId = null, joyCenter = {x:0, y:0};
+
+joyZone.addEventListener('touchstart', (e) => {
+  const t = e.changedTouches[0];
+  joyTouchId = t.identifier;
+  joyCenter = { x: t.clientX, y: t.clientY };
+  joyBase.style.left = (t.clientX - 50) + 'px';
+  joyBase.style.top = (t.clientY - 50) + 'px';
+  joyBase.style.display = 'block';
+  joyStick.style.left = (t.clientX - 23) + 'px';
+  joyStick.style.top = (t.clientY - 23) + 'px';
+}, {passive:true});
+
+joyZone.addEventListener('touchmove', (e) => {
+  for (const t of e.changedTouches) {
+    if (t.identifier !== joyTouchId) continue;
+    let dx = t.clientX - joyCenter.x;
+    let dy = t.clientY - joyCenter.y;
+    const maxR = 50;
+    const len = Math.hypot(dx, dy);
+    if (len > maxR) { dx = dx/len*maxR; dy = dy/len*maxR; }
+    joyStick.style.left = (joyCenter.x + dx - 23) + 'px';
+    joyStick.style.top = (joyCenter.y + dy - 23) + 'px';
+    move.right = dx / maxR;
+    move.forward = -dy / maxR;
+  }
+}, {passive:true});
+
+function endJoy(e) {
+  for (const t of e.changedTouches) {
+    if (t.identifier !== joyTouchId) continue;
+    joyTouchId = null;
+    joyBase.style.display = 'none';
+    move.forward = 0; move.right = 0;
+  }
+}
+joyZone.addEventListener('touchend', endJoy);
+joyZone.addEventListener('touchcancel', endJoy);
+
+// ---------- Mobile: drag to look ----------
+const lookZone = document.getElementById('lookZone');
+let lookTouchId = null, lastLook = {x:0, y:0};
+
+lookZone.addEventListener('touchstart', (e) => {
+  const t = e.changedTouches[0];
+  lookTouchId = t.identifier;
+  lastLook = { x: t.clientX, y: t.clientY };
+}, {passive:true});
+
+lookZone.addEventListener('touchmove', (e) => {
+  for (const t of e.changedTouches) {
+    if (t.identifier !== lookTouchId) continue;
+    const dx = t.clientX - lastLook.x;
+    const dy = t.clientY - lastLook.y;
+    lastLook = { x: t.clientX, y: t.clientY };
+    yaw -= dx * 0.004 * lookSensitivity;
+    pitch -= dy * 0.004 * lookSensitivity;
+    pitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, pitch));
+  }
+}, {passive:true});
+
+lookZone.addEventListener('touchend', (e) => {
+  for (const t of e.changedTouches) if (t.identifier === lookTouchId) lookTouchId = null;
+});
+
+
+// =====================================================================
+// FBX TEST MODULE — isolated proof-of-concept for the Mixamo pipeline.
+// Loads one real rigged/skinned character (X_Bot) + all 7 downloaded
+// animation clips (Idle, Running, Golf Drive [batting-swing stand-in],
+// Baseball Strike [batting-swing stand-in], Throw Object, Goalkeeper
+// Catch, Goalkeeper Diving Save) from embedded base64 FBX data, places
+// it on the outfield near the existing test billboard character, and
+// runs a small looping "AI" that cycles through every clip with a
+// crossfade so we can see each animation actually play on a real
+// skeleton before any of this touches the striker/bowler/fielder code.
+//
+// Notes on script-tag safety and CDN loading are the same fix as
+// before: this is plain JS inserted directly inside the page's single
+// existing script block (no nested script tags, no literal closing-
+// script-tag text anywhere in these comments), and the FBXLoader/fflate
+// dependencies are loaded dynamically at runtime with a CDN fallback.
+// =====================================================================
+
+const FBX_TEST = { mixer: null, model: null, ready: false, actions: {}, currentAction: null };
+// Raw parsed clips (post root-motion-strip), kept separately from FBX_TEST.actions
+// so any number of extra character instances can build their own actions from
+// the same clip data without re-parsing the animation FBX files again.
+const FBX_TEST_CLIPS = {};
+
+function _fbxLoadScript(url) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = url;
+    s.crossOrigin = 'anonymous';
+    s.onload = () => resolve(url);
+    s.onerror = () => reject(new Error('failed to load: ' + url));
+    document.head.appendChild(s);
+  });
+}
+
+async function _fbxLoadFirstWorking(urls, label) {
+  for (const url of urls) {
+    try {
+      await _fbxLoadScript(url);
+      console.log('FBX test: loaded ' + label + ' from ' + url);
+      return true;
+    } catch (err) {
+      console.warn('FBX test: ' + label + ' failed from ' + url + ' — trying next mirror if any.');
+    }
+  }
+  return false;
+}
+
+// Animation assets now live as real files served alongside this page,
+// instead of being embedded as base64 text. The browser fetches each one
+// with FBXLoader.load() the first time it's needed.
+const ANIM_BASE = './assets/animations/';
+const ANIM_FILES = {
+  xbot:                   ANIM_BASE + 'xbot.fbx',
+  idle:                   ANIM_BASE + 'idle.fbx',
+  running:                ANIM_BASE + 'running.fbx',
+  golfDrive:              ANIM_BASE + 'golf_drive.fbx',
+  baseballStrike:         ANIM_BASE + 'baseball_strike.fbx',
+  throwObject:            ANIM_BASE + 'throw_object.fbx',
+  goalkeeperCatch:        ANIM_BASE + 'goalkeeper_catch.fbx',
+  goalkeeperDivingSave:   ANIM_BASE + 'goalkeeper_diving_save.fbx',
+  baseballIdle:           ANIM_BASE + 'baseball_idle.fbx',
+  goalkeeperCatch2:       ANIM_BASE + 'goalkeeper_catch2.fbx',
+};
+
+// Promise-wrapped loader.load() so existing async functions can just
+// `await _fbxLoadUrl(loader, url)` where they used to do a synchronous
+// `loader.parse(base64Bytes, '')`.
+function _fbxLoadUrl(loader, url) {
+  return new Promise((resolve, reject) => {
+    loader.load(
+      url,
+      (obj) => resolve(obj),
+      undefined, // onProgress — not needed
+      (err) => reject(err)
+    );
+  });
+}
+
+// The X_Bot base mesh is reused for every duel character and every
+// fielder. We fetch it from the network exactly once, then each spawn
+// site below makes a SkeletonUtils.clone() of this template — a proper
+// deep clone that preserves bone bindings (a plain Object3D.clone()
+// would NOT work correctly for a skinned/animated mesh).
+let _XBOT_TEMPLATE = null;
+async function _preloadXbotTemplates(loader) {
+  _XBOT_TEMPLATE = await _fbxLoadUrl(loader, ANIM_FILES.xbot);
+}
+function _cloneXbot() {
+  return THREE.SkeletonUtils.clone(_XBOT_TEMPLATE);
+}
+
+// Every animation clip we downloaded, in the order the demo AI cycles
+// through them. Each entry maps a friendly name to its base64 constant.
+
+const FBX_TEST_CLIP_SOURCES = [
+  { name: 'idle',                 url: ANIM_FILES.idle },
+  { name: 'running',              url: ANIM_FILES.running },
+  { name: 'golfDrive',            url: ANIM_FILES.golfDrive },
+  { name: 'baseballStrike',       url: ANIM_FILES.baseballStrike },
+  { name: 'throwObject',          url: ANIM_FILES.throwObject },
+  { name: 'goalkeeperDivingSave', url: ANIM_FILES.goalkeeperDivingSave },
+  { name: 'baseballIdle',         url: ANIM_FILES.baseballIdle },
+  { name: 'goalkeeperCatch2',     url: ANIM_FILES.goalkeeperCatch2 },
+];
+
+async function runFBXTestCharacter() {
+  if (typeof THREE.FBXLoader !== 'function') {
+    console.error('FBX test: THREE.FBXLoader is still not available after loading scripts — aborting test character.');
+    return;
+  }
+
+  const loader = new THREE.FBXLoader();
+
+  // Fetch the shared X_Bot templates once, over the network, instead of
+  // decoding them from an embedded base64 string. Every later spawn site
+  // (duel characters, fielders) clones these templates instead of
+  // re-fetching/re-parsing the file again.
+  try {
+    await _preloadXbotTemplates(loader);
+  } catch (err) {
+    console.error('FBX test: failed to load X_Bot mesh from assets/animations/', err);
+    return;
+  }
+
+  const meshObj = _cloneXbot();
+
+  // Mixamo FBX characters are authored in centimeters (~180 units tall);
+  // scale to meters so it matches the ~1.9m-tall billboard characters
+  // already standing on this same field.
+  meshObj.scale.setScalar(0.01);
+
+  // Stand it near the existing test billboard character (which spawns
+  // around x=(-10..10), z=(20..30)) so it's easy to spot right on load.
+  meshObj.position.set(8, 0, 12);
+
+  meshObj.traverse((node) => {
+    if (node.isMesh) {
+      node.castShadow = true;
+      node.receiveShadow = true;
+    }
+  });
+
+  // Not added to the scene: this instance exists purely to hold the shared
+  // AnimationMixer/clip data (parsed below into FBX_TEST_CLIPS) that the
+  // bowler/striker duel characters build their own actions from — we no
+  // longer field a third "fetch" character to chase/pick up/throw the ball.
+  FBX_TEST.model = meshObj;
+  FBX_TEST.mixer = new THREE.AnimationMixer(meshObj);
+
+  // Parse every animation clip onto the same skeleton and build a
+  // clipAction for each one, so the demo AI can crossfade between them.
+  //
+  // Mixamo clips like "running" have real forward motion baked into the
+  // root bone's position track (the hips actually translate forward each
+  // loop). Since our own AI code drives model.position separately, that
+  // baked-in drift stacks on top of it and then snaps back to frame 0
+  // every time the clip loops — the "slides forward, snaps back" glitch.
+  // Fix: lock the root bone's horizontal (X/Z) position to its first-frame
+  // value on every track, in every clip, so each clip plays perfectly in
+  // place and our own code is the only thing moving the character through
+  // the world. Vertical (Y) motion — the up/down bob of a run cycle — is
+  // left untouched since that's part of the in-place animation, not travel.
+  function stripHorizontalRootMotion(clip) {
+    for (const track of clip.tracks) {
+      if (!track.name.toLowerCase().endsWith('.position')) continue;
+      if (!(track instanceof THREE.VectorKeyframeTrack)) continue;
+      const values = track.values; // flat [x0,y0,z0, x1,y1,z1, ...]
+      const x0 = values[0], z0 = values[2];
+      for (let i = 0; i < values.length; i += 3) {
+        values[i] = x0;     // lock X to the first frame
+        values[i + 2] = z0; // lock Z to the first frame
+        // values[i+1] (Y) left alone — vertical bob stays intact
+      }
+    }
+  }
+
+  let loadedCount = 0;
+  for (const src of FBX_TEST_CLIP_SOURCES) {
+    try {
+      const animObj = await _fbxLoadUrl(loader, src.url);
+      if (animObj.animations && animObj.animations.length) {
+        const clip = animObj.animations[0];
+        stripHorizontalRootMotion(clip);
+        FBX_TEST_CLIPS[src.name] = clip;
+        const action = FBX_TEST.mixer.clipAction(clip);
+        action.clampWhenFinished = false;
+        action.setLoop(THREE.LoopRepeat, Infinity);
+        FBX_TEST.actions[src.name] = action;
+        loadedCount++;
+        console.log('FBX test: "' + src.name + '" clip — duration=' + clip.duration.toFixed(2) + 's, tracks=' + clip.tracks.length);
+      } else {
+        console.warn('FBX test: ' + src.name + ' FBX parsed but contained no animation clip.');
+      }
+    } catch (err) {
+      console.error('FBX test: failed to parse animation "' + src.name + '"', err);
+    }
+  }
+
+  console.log('FBX test: loaded ' + loadedCount + '/' + FBX_TEST_CLIP_SOURCES.length + ' animation clips.');
+
+  FBX_TEST.ready = true;
+  console.log('FBX test: clip data ready — spawning the bowler/striker duel characters.');
+
+  initDuelCharacters(loader);
+}
+
+// ---- On-screen debug HUD, so we can see the duel AI's live state
+// without having to scroll a mobile console panel. ----
+const _fbxTestHud = document.createElement('div');
+_fbxTestHud.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:9999;display:none;'
+  + 'background:rgba(0,0,0,0.65);color:#0f0;font:11px monospace;'
+  + 'padding:8px 10px;border-radius:6px;white-space:pre;pointer-events:none;max-width:70vw;';
+_fbxTestHud.textContent = 'FBX test: booting…';
+document.body.appendChild(_fbxTestHud);
+
+function _fbxTestUpdateHud() {
+  if (!FBX_TEST.ready) return;
+  const lines = [
+    'FBX duel HUD',
+    'clips loaded: ' + Object.keys(FBX_TEST.actions).length + '/' + FBX_TEST_CLIP_SOURCES.length,
+    'duel state: ' + DUEL.state,
+  ];
+  if (DUEL.ball) {
+    lines.push('ball held: ' + DUEL.held);
+  }
+  lines.push('fielders: ' + FIELDERS.length + '/' + FIELDER_SPAWN_SPOTS.length);
+  for (const f of FIELDERS) {
+    lines.push('  ' + f.id + ' [' + f.role + '] ' + f.chaseState);
+  }
+  _fbxTestHud.textContent = lines.join('\n');
+}
+
+// =====================================================================
+// ---- Shared ball geometry helper. Originally built for a third
+// "fetch" character (chase/pick-up/throw); that fielder has been
+// removed, but the duel bowler/striker below still reuse this same
+// ball mesh for their delivery. ----
+// =====================================================================
+const BALL_RADIUS = 0.12; // matches a real cricket ball, in world units
+
+function createFetchBall() {
+  const ballGeo = new THREE.SphereGeometry(BALL_RADIUS, 32, 24);
+  const ballMat = new THREE.MeshStandardMaterial({ color: 0xB01E1E, roughness: 0.45, metalness: 0.05 });
+  const b = new THREE.Mesh(ballGeo, ballMat);
+  b.castShadow = true;
+  b.receiveShadow = true;
+
+  // stitched seam — a thin torus wrapped around the ball, tilted like a real seam
+  const seamGeo = new THREE.TorusGeometry(BALL_RADIUS * 1.01, BALL_RADIUS * 0.045, 8, 48);
+  const seamMat = new THREE.MeshStandardMaterial({ color: 0xf2e6d8, roughness: 0.7 });
+  const seam = new THREE.Mesh(seamGeo, seamMat);
+  seam.rotation.x = Math.PI / 2.4;
+  seam.rotation.y = 0.5;
+  b.add(seam);
+
+  return b;
+}
+
+// =====================================================================
+// ---- Duplication test: two MORE independent X_Bot instances, spawned
+// from the same base mesh + clip data as the fetch-chaser above, each
+// with their own AnimationMixer running its own state entirely
+// separately. One stands at the bowler's (non-striker) end and bowls;
+// the other stands at the striker's end holding a bat and swings at
+// the delivery. This proves multiple simultaneous instances work, not
+// just one. ----
+// =====================================================================
+const MODEL_SCALE = 0.01; // must match meshObj.scale.setScalar(0.01) above
+const BAT_SCALE_COMPENSATION = 1 / MODEL_SCALE; // a bat sized in real metres, parented under a bone inside a 0.01-scaled rig, would render 100x too small without this
+
+// Pitch-end spawn points — same stumpsZ the pitch/crease markings above use,
+// with the bowler standing just in front of his own stumps and the striker
+// just in front of his, mirroring how a real crease works.
+const stumpsZ_local = PITCH_LEN / 2 - 1.2;
+const BOWLER_END_X  = -0.75, BOWLER_END_Z  = -stumpsZ_local + 0.6;
+const STRIKER_END_X = 0,     STRIKER_END_Z = stumpsZ_local - 0.15;
+
+// How far in front of the crease (toward the bowler) the bat actually
+// meets the ball. The hit-detection used to trigger right at
+// STRIKER_END_Z — basically the stumps line — which is where a real
+// batter's body stands, not where his bat meets the ball. A bat swings
+// out in front of the body, so by the time the ball had already reached
+// STRIKER_END_Z it had visually passed the bat's swing arc already,
+// which is exactly the "ball already past the batsman, then gets hit
+// out of thin air" bug being reported. Moving the contact trigger this
+// far forward (smaller Z, since the ball travels toward +Z) makes both
+// the swing-commit timing and the impact trigger fire while the ball is
+// still out in front of the striker, where the bat actually is.
+const DUEL_CONTACT_LEAD = 0.45;
+const DUEL_CONTACT_Z = STRIKER_END_Z - DUEL_CONTACT_LEAD;
+
+// If bowler/striker end up facing the wrong way down the pitch, adjust
+// these two.
+const BOWLER_FACING_YAW  = 0;        // should face +Z, down the pitch toward the striker
+const STRIKER_FACING_YAW = Math.PI;  // should face -Z, back up the pitch toward the bowler
+
+// Bat grip: position is in the hand BONE's own local space, i.e. BEFORE the
+// rig's 0.01 scale is applied — so small real offsets need larger-looking
+// numbers here (a value of 1 ≈ 1cm once the 0.01 scale is applied). Rotation
+// is a plain angle and isn't affected by scale. Both are starting guesses —
+// nudge them if the grip looks off in your hand.
+const BAT_GRIP_LOCAL_POS = new THREE.Vector3(0, 0, 0);
+const BAT_GRIP_LOCAL_ROT = new THREE.Euler(0, 0, Math.PI / 2);
+
+// Correction applied on top of BAT_GRIP_LOCAL_POS/ROT. Needed because
+// switching the striker's idle from the generic mixamo 'idle' clip to
+// 'baseballIdle' changed the RightHand bone's rest orientation slightly,
+// so the bat (still parented with the old fixed grip offset) now sits a
+// touch off from where it used to. Nudge these numbers — not the values
+// above — to re-align the bat without touching the original grip calibration.
+const BAT_GRIP_CORRECTION_POS = new THREE.Vector3(0, 0, 0);
+const BAT_GRIP_CORRECTION_ROT = new THREE.Euler(0, 0, 0);
+
+const DUEL_BALL_RADIUS = 0.12;
+const BOWLER_CATCH_RADIUS = 1.5;  // distance from bowler center where ball auto-catches
+const BOWLER_FIELD_RADIUS = 4;    // how far from the bowler he will notice the ball and start chasing (reduced from 12 — at 12 it covered most of the pitch, so almost every straight-back shot got auto-caught by the bowler within a fraction of a second of contact, which read as "the ball disappears right after the hit" instead of a real fielding sequence)
+const BOWLER_CHASE_BOUNDARY_R = 50;  // personal fielding zone radius around his HOME POSITION (not origin) — he won't chase balls beyond this
+
+// Hit quality label system
+let hitQualityLabels = [];  // active labels
+
+function createHitQualityLabel(quality, powerMult) {
+  // Create 2D HTML label at top-right corner
+  const label = document.createElement('div');
+  label.style.position = 'fixed';
+  label.style.top = '12px';
+  label.style.right = '60px';
+  label.style.transform = 'none';
+  label.style.fontSize = '14px';
+  label.style.fontWeight = 'bold';
+  label.style.fontFamily = 'Arial, sans-serif';
+  label.style.zIndex = '9999';
+  label.style.pointerEvents = 'none';
+  label.style.textShadow = '2px 2px 4px rgba(0,0,0,1)';
+  label.style.padding = '6px 12px';
+  label.style.backgroundColor = 'rgba(0, 0, 0, 0.6)';
+  label.style.border = '1px solid';
+  label.style.borderRadius = '6px';
+  label.style.transition = 'opacity 0.3s ease-out';
+  
+  // Color and border based on quality
+  let text = 'UNKNOWN';
+  let powerText = '';
+  
+  if (quality === 'middle') {
+    label.style.color = '#00FF00';  // green
+    label.style.borderColor = '#00FF00';
+    text = 'MIDDLE';
+    powerText = ' (+80%)';
+  } else if (quality === 'offcenter') {
+    label.style.color = '#FFFF00';  // yellow
+    label.style.borderColor = '#FFFF00';
+    text = 'OFFCENTER';
+    powerText = ' (normal)';
+  } else if (quality === 'edge') {
+    label.style.color = '#FF0000';  // red
+    label.style.borderColor = '#FF0000';
+    text = 'EDGE';
+    powerText = ' (-65%)';
+  }
+  
+  label.textContent = text + powerText;
+  document.body.appendChild(label);
+  
+  // Auto-remove after 1.5 seconds with fade
+  hitQualityLabels.push({
+    element: label,
+    timer: 0,
+    duration: 1.5
+  });
+}
+
+function updateHitLabels(dt) {
+  for (let i = hitQualityLabels.length - 1; i >= 0; i--) {
+    const label = hitQualityLabels[i];
+    label.timer += dt;
+    
+    // Fade out
+    const opacity = Math.max(0, 1 - (label.timer / label.duration));
+    label.element.style.opacity = opacity;
+    
+    if (label.timer >= label.duration) {
+      label.element.remove();
+      hitQualityLabels.splice(i, 1);
+    }
+  }
+}
+const DUEL_GRAVITY = -10.2;
+const DUEL_BOUNCE_RESTITUTION = 0.42; // fallback only — used when the smart-bounce solve below can't apply
+const DUEL_CONTACT_HEIGHT_MIN = 0.65; // lowest height (m) the bounce should have risen to by the time the ball reaches the striker
+const DUEL_CONTACT_HEIGHT_MAX = 1.05; // highest height (m) — kept varied ball-to-ball but always within bat reach
+const DUEL_BOWL_PACE = 13;           // horizontal delivery speed, m/s — gentle enough to clearly see the arc + bounce
+const DUEL_GOOD_LENGTH_FRAC = 0.5;   // ball pitches roughly halfway down the pitch
+const DUEL_PAUSE_BEFORE_BOWL = 1.2;  // seconds the bowler holds "idle" before each delivery
+const DUEL_RELEASE_FRAC = 0.5;       // fraction through the throw clip when the ball actually leaves the hand
+const DUEL_SWING_IMPACT_FRAC = 0.4;  // fraction through the swing clip that counts as bat-meets-ball
+const DUEL_SWING_EXTRA_LEAD = 2.0;   // extra seconds added on top of the animation/footwork lead time — pushes the swing commit point earlier so the striker starts swinging this many seconds sooner than the bare minimum needed
+const DUEL_HIT_RADIUS = 0.95;        // how close the ball must be to the bat mesh's actual world position at the impact frame to count as a hit
+const DUEL_STRIKER_SHUFFLE_MAX = 0.5;   // max lateral distance (m) the striker can shuffle off his guard spot to get in line
+const DUEL_STRIKER_SHUFFLE_SPEED = 6;   // m/s the striker's root can shuffle sideways — fast enough to look reactive, not instant
+const DUEL_BAT_NATURAL_HEIGHT = 0.85;   // roughly where the bat's sweet spot sits mid-swing with the striker's root at its neutral Y — the nudge below is measured relative to this
+const DUEL_SWING_REACH_Y_MIN = 0.35;    // lowest ball height (m) the bat can plausibly reach, even with the crouch nudge — below this it's a genuine yorker/full toss he has to leave
+const DUEL_SWING_REACH_Y_MAX = 1.4;     // highest ball height (m) the bat can plausibly reach, even with the rise nudge — above this it's a proper bouncer, left alone
+const DUEL_SWING_REACH_X_MAX = DUEL_STRIKER_SHUFFLE_MAX + 0.35; // widest sideways offset (m), from the crease centre, the bat can reach — shuffle range plus arm/bat extension. Beyond this it's a genuine wide he has to leave, same idea as the Y check above.
+const DUEL_STRIKER_VSHUFFLE_MAX = 0.15; // max vertical root nudge (m) — a slight crouch for a low ball or rise for a bouncer, not a full body move
+const DUEL_STRIKER_VSHUFFLE_SPEED = 3;  // m/s vertical shuffle speed — subtler/slower than the lateral one
+const DUEL_HIT_WINDOW_FRAC = 0.08;      // +/- fraction of the swing clip's duration, centered on the impact frac, over which we keep sampling bat/ball distance each frame instead of just once — absorbs frame-rate jitter around the true contact instant
+const DUEL_RESET_DELAY = 1.5;        // seconds after a delivery resolves before the next one starts
+const DUEL_RESOLVED_WATCHDOG_TIMEOUT = 8; // fail-safe: max seconds to sit in 'resolved' waiting on the chase/pickup/throw/catch loop before forcing the next delivery anyway — covers a ball nobody ever reaches, a fielder stuck against something, or a return throw that never gets within pickup range of the bowler
+
+const DUEL = {
+  striker: null, ball: null,
+  ballVel: new THREE.Vector3(),
+  state: 'ready', stateTimer: 0,
+  delivered: false, held: true,
+  // swung: true only while the swing animation is actually playing. It
+  // used to stay true for the rest of the whole delivery (all the way
+  // through the ~1.5s "resolved" wait), which is why the striker's
+  // shuffled/crouched tracking position sat frozen off his guard spot
+  // that whole time and then hard-snapped back the instant the next
+  // delivery reset — that's the "not being false right away" bug.
+  // committedThisBall is the separate "has this ball's swing decision
+  // already been made" gate, so a second swing can't retrigger once the
+  // first one's done and swung has reset.
+  swung: false, committedThisBall: false,
+  swingTimer: 0, impactApplied: false, released: false,
+  bowlTimer: null, // tracks the bowler's own throw-clip progress, independent of DUEL.state
+  leftBall: false, // true once a delivery's predicted height is judged out of reach and he's decided not to swing at all
+  afterHit: false, // true from the moment hitBall() fires until the next resetDelivery — gates the rolling-friction fix so it only touches the post-hit outfield roll, not the bowler's own pitch-bounce
+  fielderReactionTimer: 0, // counts down from FIELDER_REACTION_DELAY once hitBall() fires — see updateFielderAI
+  // ---- Pass 4/5/6: pickup + return throw + bowler collects. ----
+  returning: false, // true once a fielder's return throw is airborne/rolling back toward the bowler — the ball is no longer "held" by anyone, it's a free projectile again, same as the original hit
+  returnComplete: false, // set true the instant the bowler collects the returned ball — gates DUEL_RESET_DELAY in the 'resolved' branch so the next delivery can't start until the whole chase/throw/collect loop has actually finished
+  ballHeldByFielder: false, // true from the moment a fielder 'arrived's at the ball through the throw wind-up (pre-release) — blocks the main ball-physics block below so the ball doesn't keep falling/rolling on its own while someone's supposedly holding it
+  // fielderClaim: the id of the ONE fielder allowed to handle the current
+  // ball past 'chasing' — set the instant a fielder arrives (Pass 4) and
+  // cleared by resetDelivery. Multiple fielders can still race toward the
+  // ball while it's in the air (that's fine, matches the reference AI),
+  // but only the first to actually arrive is allowed to pick it up/throw
+  // it; everyone else stands down. This is the fix for the bug where two
+  // fielders both "arrived" on the same ball and each ran their own
+  // pickup->throw->catch sequence — a straggler's late catch could land
+  // after the game had already reset and moved on to the next delivery,
+  // permanently corrupting returnComplete and gluing every future ball to
+  // the bowler's hands (see updateCaughtBallHold).
+  fielderClaim: null,
+  // ---- Deterministic return-throw flight (see updateFielderAI's release
+  // pass + updateReturnThrow) — replaces the old free-projectile physics
+  // for the fielder-to-bowler throw so it always actually arrives.
+  returnThrowStart: null, returnThrowTarget: null,
+  returnThrowDuration: 0, returnThrowElapsed: 0,
+  // Where the shuffle/crouch tracking currently wants the striker's root —
+  // eased toward every frame (see the bottom of the 'inFlight' branch) so
+  // he glides back to his guard spot as soon as the swing/leave is done,
+  // instead of staying stuck in the offset pose until the hard reset.
+  shuffleTargetX: STRIKER_END_X, shuffleTargetY: 0,
+};
+
+// ---- Fielders: same base character, spawned at fixed home positions
+// around the outfield. Starting with just 3 (mirrors the reference 2D
+// fielder AI's own starting set) — chase/catch/throw AI comes in later
+// passes, one at a time, on top of this. Positions are within
+// OUTFIELD_R/BOUNDARY_R (70/68) so nobody's already standing in the stands.
+const FIELDER_SPAWN_SPOTS = [
+  { id: 'fielder_cover',     role: 'cover',      x: 40,  z: 15  },
+  { id: 'fielder_midwicket', role: 'mid-wicket', x: -38, z: 20  },
+  { id: 'fielder_point',     role: 'point',      x: 32,  z: -28 },
+];
+let FIELDERS = []; // populated by initDuelCharacters -> spawnFielder, one entry per spot above
+
+// ---- Pass 2/3: reaction + chase. Local boundary radius since OUTFIELD_R/
+// BOUNDARY_R (used for the visible grass/rope) are scoped inside the setup
+// try-block above and aren't reachable down here — this is the same 68m
+// rope distance, just re-declared where the chase logic can see it.
+const FIELDER_BOUNDARY_R      = 66;   // never chase past this — clamp their run target just inside the rope
+const FIELDER_REACTION_RADIUS = 38;   // how far from the ball a 'base' fielder will notice it and start chasing
+const FIELDER_REACTION_DELAY  = 0.35; // seconds after the hit before anyone reacts — a beat, not instant
+const FIELDER_CHASE_SPEED     = 9.5;  // m/s sprint speed while chasing
+const FIELDER_CHASE_ARRIVE_DIST = 1.0; // how close counts as "reached the ball"
+
+// ---- Pass 4/5/6: pickup, return throw, bowler collects. Reuses the same
+// throwObject clip the bowler bowls with (it's the only throw-style clip
+// loaded) — a fielder's "gather the ball" beat is just a short pause on
+// 'idle' before that clip plays, not a separate animation.
+const FIELDER_PICKUP_DELAY      = 0.3;  // seconds spent "gathering" the ball once arrived, before the throw animation starts
+const FIELDER_THROW_RELEASE_FRAC = 0.5; // fraction through throwObject when the ball actually leaves the hand — mirrors DUEL_RELEASE_FRAC for the bowler's own delivery
+const FIELDER_THROW_PACE        = 20;   // m/s horizontal speed of the return throw — brisker than a chase, slower than a full bowling delivery
+const BOWLER_CATCH_DIST         = 1.4;  // how close the returned ball must get to the bowler (x/z) to count as collected
+const BOWLER_CATCH_HEIGHT       = 2.3;  // max ball height the bowler can pluck out of the air — above this it just sails past and has to come down/roll in first
+
+
+// data, with its own AnimationMixer and its own set of actions built from
+// the shared FBX_TEST_CLIPS (the clip resource can be reused across many
+// mixers — only the per-character AnimationAction needs to be separate).
+function spawnDuelCharacter(loader, x, z, yaw) {
+  let model = null;
+  try {
+    model = _cloneXbot();
+  } catch (err) {
+    console.error('Duel test: failed to clone an extra X_Bot instance', err);
+    return null;
+  }
+  model.scale.setScalar(MODEL_SCALE);
+  model.position.set(x, 0, z);
+  model.rotation.y = yaw;
+  model.traverse((node) => {
+    if (node.isMesh) { node.castShadow = true; node.receiveShadow = true; }
+  });
+  scene.add(model);
+
+  const mixer = new THREE.AnimationMixer(model);
+  const actions = {};
+  for (const name in FBX_TEST_CLIPS) {
+    const action = mixer.clipAction(FBX_TEST_CLIPS[name]);
+    action.clampWhenFinished = false;
+    action.setLoop(THREE.LoopRepeat, Infinity);
+    actions[name] = action;
+  }
+
+  // Add procedural walk animation
+  {
+    const bones = {};
+    model.traverse((node) => {
+      if (node.isBone) bones[node.name] = node;
+    });
+    
+    function findBone(patterns) {
+      if (!Array.isArray(patterns)) patterns = [patterns];
+      for (const name in bones) {
+        const nameLower = name.toLowerCase();
+        for (const pat of patterns) {
+          if (nameLower.includes(pat.toLowerCase())) return bones[name];
+        }
+      }
+      return null;
+    }
+    
+    const tracks = [];
+    const leftLeg = findBone(['leftleg', 'left_leg', 'legup_l', 'l_leg']);
+    const rightLeg = findBone(['rightleg', 'right_leg', 'legup_r', 'r_leg']);
+    
+    if (leftLeg) {
+      tracks.push(new THREE.QuaternionKeyframeTrack(
+        leftLeg.name + '.quaternion',
+        [0, 0.5, 1, 1.5, 2],
+        [0,0,0,1, 0.2,0,0,0.98, 0,0,0.15,1, -0.2,0,0,0.98, 0,0,0,1]
+      ));
+    }
+    if (rightLeg) {
+      tracks.push(new THREE.QuaternionKeyframeTrack(
+        rightLeg.name + '.quaternion',
+        [0, 0.5, 1, 1.5, 2],
+        [-0.2,0,0,0.98, 0,0,-0.15,1, 0.2,0,0,0.98, 0,0,0.15,1, -0.2,0,0,0.98]
+      ));
+    }
+    
+    if (tracks.length > 0) {
+      const walkClip = new THREE.AnimationClip('walk', 2, tracks);
+      const walkAction = mixer.clipAction(walkClip);
+      walkAction.clampWhenFinished = false;
+      walkAction.setLoop(THREE.LoopRepeat, Infinity);
+      actions['walk'] = walkAction;
+    }
+  }
+
+  return { model, mixer, actions, currentAction: null };
+
+function createProceduralAnimationsForCharacter(character, mixer) {
+  const bones = {};
+  const clips = {};
+  
+  character.traverse((node) => {
+    if (node.isBone) {
+      bones[node.name] = node;
+    }
+  });
+  
+  // Helper to find bone by pattern
+  function findBone(patterns) {
+    if (!Array.isArray(patterns)) patterns = [patterns];
+    for (const name in bones) {
+      const nameLower = name.toLowerCase();
+      for (const pat of patterns) {
+        if (nameLower.includes(pat.toLowerCase())) return bones[name];
+      }
+    }
+    return null;
+  }
+  
+  // IDLE animation
+  {
+    const tracks = [];
+    const spine = findBone(['spine', 'chest', 'armature']);
+    if (spine) {
+      tracks.push(new THREE.QuaternionKeyframeTrack(
+        spine.name + '.quaternion',
+        [0, 1, 2, 3],
+        [0, 0, 0, 1,  0.03, 0, -0.03, 0.9995,  0.02, 0, 0.02, 0.9995,  0, 0, 0, 1]
+      ));
+    }
+    if (tracks.length > 0) {
+      clips['idle'] = new THREE.AnimationClip('idle', 3, tracks);
+    }
+  }
+  
+  // WALK animation
+  {
+    const tracks = [];
+    const leftLeg = findBone(['leftleg', 'left_leg', 'legup_l', 'l_leg']);
+    const rightLeg = findBone(['rightleg', 'right_leg', 'legup_r', 'r_leg']);
+    
+    if (leftLeg) {
+      tracks.push(new THREE.QuaternionKeyframeTrack(
+        leftLeg.name + '.quaternion',
+        [0, 0.5, 1, 1.5, 2],
+        [0,0,0,1, 0.2,0,0,0.98, 0,0,0.15,1, -0.2,0,0,0.98, 0,0,0,1]
+      ));
+    }
+    if (rightLeg) {
+      tracks.push(new THREE.QuaternionKeyframeTrack(
+        rightLeg.name + '.quaternion',
+        [0, 0.5, 1, 1.5, 2],
+        [-0.2,0,0,0.98, 0,0,-0.15,1, 0.2,0,0,0.98, 0,0,0.15,1, -0.2,0,0,0.98]
+      ));
+    }
+    
+    if (tracks.length > 0) {
+      clips['walk'] = new THREE.AnimationClip('walk', 2, tracks);
+    }
+  }
+  
+  // SWING animation
+  {
+    const tracks = [];
+    const leftArm = findBone(['leftarm', 'left_arm', 'uparm_l', 'l_arm']);
+    const rightArm = findBone(['rightarm', 'right_arm', 'uparm_r', 'r_arm']);
+    const spine = findBone(['spine', 'chest', 'armature']);
+    
+    if (leftArm) {
+      tracks.push(new THREE.QuaternionKeyframeTrack(
+        leftArm.name + '.quaternion',
+        [0, 0.3, 0.6],
+        [0,0,0,1, -0.4,-0.2,0.15,0.88, 0,0,0,1]
+      ));
+    }
+    if (rightArm) {
+      tracks.push(new THREE.QuaternionKeyframeTrack(
+        rightArm.name + '.quaternion',
+        [0, 0.3, 0.6],
+        [0,0,0,1, 0.4,0.2,-0.15,0.88, 0,0,0,1]
+      ));
+    }
+    if (spine) {
+      tracks.push(new THREE.QuaternionKeyframeTrack(
+        spine.name + '.quaternion',
+        [0, 0.3, 0.6],
+        [0,0,0,1, -0.08,0.15,0,0.99, 0,0,0,1]
+      ));
+    }
+    
+    if (tracks.length > 0) {
+      clips['swing'] = new THREE.AnimationClip('swing', 0.6, tracks);
+    }
+  }
+  
+  // Convert clips to actions on mixer
+  const actions = {};
+  for (const name in clips) {
+    const action = mixer.clipAction(clips[name]);
+    action.clampWhenFinished = false;
+    action.setLoop(THREE.LoopRepeat, Infinity);
+    actions[name] = action;
+  }
+  
+  return actions;
+}
+
+}
+
+// Same independent-instance pattern as spawnDuelCharacter above (its own
+// fresh parse, its own mixer, its own actions) — proven safe to run many of
+// at once since each mixer only touches its own model. The extra bit here
+// is the ID card: id/role/home, so console logs and the HUD can say exactly
+// which fielder is which instead of just an anonymous list of meshes. home
+// is where chase/return-throw AI (later passes) will send them back to
+// between deliveries; for now it's just where they spawn and stand.
+function spawnFielder(loader, spot) {
+  let model = null;
+  try {
+    model = _cloneXbot();
+  } catch (err) {
+    console.error('Fielder spawn: failed to clone an extra X_Bot instance for ' + spot.id, err);
+    return null;
+  }
+  model.scale.setScalar(MODEL_SCALE);
+  model.position.set(spot.x, 0, spot.z);
+  // Face roughly toward the pitch centre so they're not spawned staring
+  // out at the boundary — good enough for a standing-still first pass.
+  model.rotation.y = Math.atan2(-spot.x, -spot.z);
+  model.traverse((node) => {
+    if (node.isMesh) { node.castShadow = true; node.receiveShadow = true; }
+  });
+  scene.add(model);
+
+  const mixer = new THREE.AnimationMixer(model);
+  const actions = {};
+  for (const name in FBX_TEST_CLIPS) {
+    const action = mixer.clipAction(FBX_TEST_CLIPS[name]);
+    action.clampWhenFinished = false;
+    action.setLoop(THREE.LoopRepeat, Infinity);
+    actions[name] = action;
+  }
+
+  // Add procedural walk animation
+  {
+    const bones = {};
+    model.traverse((node) => {
+      if (node.isBone) bones[node.name] = node;
+    });
+    
+    function findBone(patterns) {
+      if (!Array.isArray(patterns)) patterns = [patterns];
+      for (const name in bones) {
+        const nameLower = name.toLowerCase();
+        for (const pat of patterns) {
+          if (nameLower.includes(pat.toLowerCase())) return bones[name];
+        }
+      }
+      return null;
+    }
+    
+    const tracks = [];
+    const leftLeg = findBone(['leftleg', 'left_leg', 'legup_l', 'l_leg']);
+    const rightLeg = findBone(['rightleg', 'right_leg', 'legup_r', 'r_leg']);
+    
+    if (leftLeg) {
+      tracks.push(new THREE.QuaternionKeyframeTrack(
+        leftLeg.name + '.quaternion',
+        [0, 0.5, 1, 1.5, 2],
+        [0,0,0,1, 0.2,0,0,0.98, 0,0,0.15,1, -0.2,0,0,0.98, 0,0,0,1]
+      ));
+    }
+    if (rightLeg) {
+      tracks.push(new THREE.QuaternionKeyframeTrack(
+        rightLeg.name + '.quaternion',
+        [0, 0.5, 1, 1.5, 2],
+        [-0.2,0,0,0.98, 0,0,-0.15,1, 0.2,0,0,0.98, 0,0,0.15,1, -0.2,0,0,0.98]
+      ));
+    }
+    
+    if (tracks.length > 0) {
+      const walkClip = new THREE.AnimationClip('walk', 2, tracks);
+      const walkAction = mixer.clipAction(walkClip);
+      walkAction.clampWhenFinished = false;
+      walkAction.setLoop(THREE.LoopRepeat, Infinity);
+      actions['walk'] = walkAction;
+    }
+  }
+
+  const fielder = {
+    id: spot.id,
+    role: spot.role,
+    home: { x: spot.x, z: spot.z },
+    model, mixer, actions, currentAction: null,
+    // chaseState machine: 'base' (at home, idle) -> 'chasing' (sprinting to
+    // the predicted landing/lead point) -> 'arrived' (reached the ball,
+    // pausing to gather it) -> 'throwing' (playing throwObject, ball
+    // released partway through) -> 'returned' (job done for this ball,
+    // just stands there until resetDelivery sends everyone back to 'base').
+    chaseState: 'base',
+    pickupTimer: 0, // counts up while 'arrived', gates the FIELDER_PICKUP_DELAY pause before the throw starts
+    throwTimer: 0,  // counts up while 'throwing', tracked against the throwObject clip's own duration
+    thrown: false,  // true once this fielder's throw has actually released the ball, so it only fires once per throwObject playthrough
+  };
+  console.log('Fielder spawned: ' + fielder.id + ' (' + fielder.role + ') at ('
+    + spot.x.toFixed(1) + ',' + spot.z.toFixed(1) + ').');
+  return fielder;
+}
+
+// ---- Pass 2/3/4/5: reaction + chase + pickup + return throw. Same shape as
+// the reference 2D fielder AI's reaction-radius trigger + predicted-
+// landing-point chase, adapted to this file's single struck ball
+// (DUEL.ball/ballVel) instead of a whole scoring/running game. The chase
+// loop below hands off to 'arrived' -> pickup -> 'throwing' -> return-throw
+// release, all in this same function; the bowler's side of the catch
+// (Pass 6) lives in updateReturnThrow() right after it.
+function updateFielderAI(dt) {
+  if (!DUEL.ball || !DUEL.afterHit) return; // nothing to react to until a ball's actually been hit
+
+  if (DUEL.fielderReactionTimer > 0) DUEL.fielderReactionTimer -= dt;
+
+  // Trigger: any 'base' fielder within reaction range starts chasing once
+  // the reaction delay's elapsed. More than one can still trigger on the
+  // same ball while nobody's claimed it yet — there's no single designated
+  // fielder up front, whoever's close enough goes for it, same as the
+  // reference AI. Once someone has actually claimed the ball (arrived on
+  // it — see the pickup pass below), we stop handing out new chases for it.
+  if (DUEL.fielderReactionTimer <= 0 && DUEL.fielderClaim === null) {
+    for (const f of FIELDERS) {
+      if (f.chaseState !== 'base') continue;
+      const d = Math.hypot(f.model.position.x - DUEL.ball.position.x, f.model.position.z - DUEL.ball.position.z);
+      if (d <= FIELDER_REACTION_RADIUS) f.chaseState = 'chasing';
+    }
+  }
+
+  for (const f of FIELDERS) {
+    if (f.chaseState !== 'chasing') continue;
+
+    // Someone else already claimed the ball while this fielder was still
+    // en route (they arrived first) — stand down instead of also piling
+    // onto it. Without this, a straggler can reach the ball mid-return-
+    // flight, re-freeze it in their own hands, and run a second parallel
+    // pickup/throw sequence on top of the first fielder's.
+    if (DUEL.fielderClaim !== null && DUEL.fielderClaim !== f.id) {
+      f.chaseState = 'base';
+      _duelPlayAction(f, 'idle');
+      continue;
+    }
+
+    // Aim at the ball's predicted landing point while it's still airborne
+    // (solved from its current height/vertical speed under DUEL_GRAVITY,
+    // same idea as the reference AI's projectile solve), or a short lead
+    // off its current velocity once it's already rolling on the ground.
+    let aimX, aimZ;
+    const grounded = DUEL.ball.position.y <= DUEL_BALL_RADIUS + 0.05;
+    if (!grounded && DUEL.ballVel.y < 0.05) {
+      const y0 = DUEL.ball.position.y - DUEL_BALL_RADIUS;
+      const vy = DUEL.ballVel.y;
+      const g = DUEL_GRAVITY;
+      const disc = vy * vy - 2 * g * y0;
+      const t = disc > 0 ? (-vy + Math.sqrt(disc)) / g : 0.3;
+      const tClamped = Math.max(0.05, Math.min(t, 3));
+      aimX = DUEL.ball.position.x + DUEL.ballVel.x * tClamped;
+      aimZ = DUEL.ball.position.z + DUEL.ballVel.z * tClamped;
+    } else {
+      const leadTime = 0.35;
+      aimX = DUEL.ball.position.x + DUEL.ballVel.x * leadTime;
+      aimZ = DUEL.ball.position.z + DUEL.ballVel.z * leadTime;
+    }
+    // Never sprint into the stands chasing a lofted aim point.
+    const aimDist = Math.hypot(aimX, aimZ);
+    if (aimDist > FIELDER_BOUNDARY_R) {
+      const s = FIELDER_BOUNDARY_R / aimDist;
+      aimX *= s; aimZ *= s;
+    }
+
+    // "Arrived" is judged against the ball's REAL current position, not the
+    // lead/predicted point, so they don't stop short of a ball that curved
+    // away from the prediction.
+    const realDist = Math.hypot(DUEL.ball.position.x - f.model.position.x, DUEL.ball.position.z - f.model.position.z);
+    if (realDist <= FIELDER_CHASE_ARRIVE_DIST) {
+      // Claim the ball right here, at the moment of arrival — this is what
+      // makes the "only one fielder handles it" rule actually stick. If
+      // two fielders arrive on the very same frame, whichever the FIELDERS
+      // loop reaches first wins the claim; the other sees fielderClaim
+      // already taken next iteration (or next frame, worst case) and
+      // stands down via the check above.
+      DUEL.fielderClaim = f.id;
+      f.chaseState = 'arrived';
+      _duelPlayAction(f, 'idle');
+      console.log('Fielder ' + f.id + ' reached the ball — gathering it.');
+      continue;
+    }
+
+    const dx = aimX - f.model.position.x;
+    const dz = aimZ - f.model.position.z;
+    const dist = Math.hypot(dx, dz);
+    if (dist > 0.0001) {
+      // Forward-facing convention here matches BOWLER_FACING_YAW/STRIKER_
+      // FACING_YAW above: forward(yaw) = (sin(yaw), 0, cos(yaw)).
+      f.model.rotation.y = Math.atan2(dx, dz);
+      const step = Math.min(dist, FIELDER_CHASE_SPEED * dt);
+      f.model.position.x += (dx / dist) * step;
+      f.model.position.z += (dz / dist) * step;
+    }
+    _duelPlayAction(f, 'walk');
+  }
+
+  // ---- Pass 4: pickup. A fielder who's 'arrived' pauses briefly —
+  // "gathering" the ball — before the throw animation starts. The ball is
+  // treated as held by them for this whole window: DUEL.ballHeldByFielder
+  // blocks the main ball-physics block in updateDuel so it doesn't keep
+  // falling/rolling on its own while someone's supposedly got hold of it.
+  for (const f of FIELDERS) {
+    if (f.chaseState !== 'arrived') continue;
+    // Defensive state-guard (second safety net): even if something upstream
+    // let a non-claimant reach 'arrived' — a stale reference, an edge case
+    // in the standing-down logic above — this refuses to let anyone but
+    // the actual claimant touch the ball here.
+    if (DUEL.fielderClaim !== f.id) { f.chaseState = 'base'; continue; }
+    DUEL.ballHeldByFielder = true;
+    // Snap the ball to roughly hand height at the fielder's position so it
+    // visibly stays with them while they gather it, instead of sitting
+    // wherever it happened to come to rest on the ground.
+    DUEL.ball.position.set(f.model.position.x, 1.0, f.model.position.z);
+    DUEL.ball.visible = true;
+    f.pickupTimer += dt;
+    if (f.pickupTimer >= FIELDER_PICKUP_DELAY) {
+      f.chaseState = 'throwing';
+      f.pickupTimer = 0;
+      f.throwTimer = 0;
+      f.thrown = false;
+      // Square up to the bowler before the throw animation rips off —
+      // same forward(yaw) = (sin(yaw), 0, cos(yaw)) convention used
+      // everywhere else in the duel/fielder code.
+      const dxB = BOWLER_END_X - f.model.position.x;
+      const dzB = BOWLER_END_Z - f.model.position.z;
+      f.model.rotation.y = Math.atan2(dxB, dzB);
+      _duelPlayAction(f, 'throwObject');
+    }
+  }
+
+  // ---- Pass 5: return throw. Same release-fraction pattern the bowler's
+  // own delivery uses (see updateDuel's bowlTimer handling) — the ball
+  // stays glued to the fielder's hand until partway through the throwObject
+  // clip, then launches on its own analytic arc back toward the bowler's
+  // end, aimed to arrive at roughly chest height for an easy collect.
+  for (const f of FIELDERS) {
+    if (f.chaseState !== 'throwing') continue;
+    // Same defensive guard as the pickup pass — only the claimant may
+    // actually launch the ball.
+    if (DUEL.fielderClaim !== f.id) { f.chaseState = 'base'; continue; }
+    const throwClip = f.actions.throwObject.getClip();
+    f.throwTimer += dt;
+
+    if (!f.thrown && f.throwTimer >= throwClip.duration * FIELDER_THROW_RELEASE_FRAC) {
+      f.thrown = true;
+      DUEL.ballHeldByFielder = false;
+      DUEL.returning = true;
+
+      // FIX: previously this launched the ball as a free projectile
+      // (velocity + gravity) and relied on an analytic vy0 solve landing it
+      // within BOWLER_CATCH_DIST/HEIGHT at exactly the right instant. Any
+      // per-frame dt jitter, or a ground bounce redirect near arrival,
+      // could make it miss that narrow window — the ball would then just
+      // roll away with nothing left to re-aim it, DUEL.returning stayed
+      // true, and the whole chase/pickup/throw/collect loop sat stalled
+      // until the 8s watchdog force-reset (that's the "throw never reaches
+      // the bowler" symptom). A return throw always goes fielder-to-bowler
+      // — it doesn't need free-flight physics — so just interpolate it
+      // along that path over a fixed flight time and guarantee the catch
+      // at the end, same as the reference 2D fielderReleaseThrow/keeper-
+      // catch, which always resolves cleanly.
+      const releasePos = f.model.position.clone();
+      releasePos.y = 1.6; // roughly shoulder height for a fielder's release
+      const targetPos = { x: BOWLER_END_X, y: 1.1, z: BOWLER_END_Z }; // roughly chest height for the bowler to pluck out of the air
+      const dist = Math.max(0.001, Math.hypot(targetPos.x - releasePos.x, targetPos.z - releasePos.z));
+      const flightTime = Math.max(0.15, dist / FIELDER_THROW_PACE);
+
+      DUEL.returnThrowStart = releasePos;
+      DUEL.returnThrowTarget = targetPos;
+      DUEL.returnThrowDuration = flightTime;
+      DUEL.returnThrowElapsed = 0;
+
+      DUEL.ball.position.copy(releasePos);
+      DUEL.ballVel.set(0, 0, 0); // no longer driving return-throw motion, kept zeroed for consistency
+      DUEL.ball.visible = true;
+      console.log('Fielder ' + f.id + ' released the return throw — ' + flightTime.toFixed(2) + 's flight to the bowler.');
+    } else if (!f.thrown) {
+      // Still winding up — keep the ball glued to the hand.
+      DUEL.ball.position.set(f.model.position.x, 1.0, f.model.position.z);
+    }
+
+    if (f.throwTimer >= throwClip.duration) {
+      _duelPlayAction(f, 'idle');
+      f.chaseState = 'returned'; // job done — resetDelivery sends everyone back to 'base' for the next ball
+    }
+  }
+}
+
+// ---- Pass 6: bowler collects. FIX: this used to simulate the returned
+// ball as a free projectile (gravity + bounce) and only counted it
+// "collected" if it happened to pass within BOWLER_CATCH_DIST/HEIGHT of
+// the bowler at exactly the right instant — a narrow window that real
+// per-frame timing/bounce jitter could miss, after which the ball just
+// rolled off with nothing to bring it back (DUEL.returning stuck true,
+function updateReturnThrow(dt) {
+  if (!DUEL.returning) return;
+
+  DUEL.returnThrowElapsed += dt;
+  const frac = Math.min(1, DUEL.returnThrowElapsed / DUEL.returnThrowDuration);
+  const start = DUEL.returnThrowStart;
+  const target = DUEL.returnThrowTarget;
+
+  DUEL.ball.position.x = start.x + (target.x - start.x) * frac;
+  DUEL.ball.position.z = start.z + (target.z - start.z) * frac;
+  // Straight-line height lerp plus a sine hump for a visible arc/lob —
+  // purely cosmetic, doesn't feed back into the arrival check below.
+  const baseY = start.y + (target.y - start.y) * frac;
+  const arcHeight = Math.min(2.5, 0.6 + Math.hypot(target.x - start.x, target.z - start.z) * 0.03);
+  DUEL.ball.position.y = baseY + Math.sin(frac * Math.PI) * arcHeight;
+
+  // AUTO-CATCH: if ball reaches target or goes beyond, trigger catch
+  const catchRadius = 2.0;  // acceptance radius without bowler model
+  const distToTarget = Math.hypot(
+    DUEL.ball.position.x - DUEL.returnThrowTarget.x,
+    DUEL.ball.position.z - DUEL.returnThrowTarget.z
+  );
+  
+  if (distToTarget <= catchRadius || frac >= 1) {
+    // Ball caught — reset for next delivery
+    DUEL.returning = false;
+    DUEL.returnComplete = true;
+    DUEL.stateTimer = 0;
+    DUEL.ballVel.set(0, 0, 0);
+    DUEL.ball.visible = false;  // disappear 
+    console.log('Ball auto-caught — next delivery incoming.');
+  }
+}
+
+// Keeps the caught ball glued to the bowler's hands through the
+// Play an animation action on a character with smooth crossfading
+function _duelPlayAction(char, name) {
+  const next = char.actions[name];
+  if (!next || char.currentAction === next) return;
+  next.reset();
+  next.setEffectiveWeight(1);
+  next.play();
+  if (char.currentAction) {
+    char.currentAction.crossFadeTo(next, 0.25, true);
+  } else {
+    // First action this character has ever played (e.g. the very first
+    // "idle" right after spawning): force the mixer to evaluate frame 0
+    // of it immediately, rather than waiting for the next animate() tick.
+    // Without this the model — and anything rigidly parented to one of
+    // its bones, like the striker's bat — sits in the raw T-pose bind
+    // position for a frame, which reads as the bat "popping" into place
+    // mid-animation instead of already being held in the idle stance.
+    char.mixer.update(0);
+  }
+  char.currentAction = next;
+}
+
+function createCricketBat() {
+  const group = new THREE.Group();
+  const handleMat = new THREE.MeshStandardMaterial({ color: 0x2b2b2b, roughness: 0.8 });
+  const bladeMat  = new THREE.MeshStandardMaterial({ color: 0xdcc088, roughness: 0.6 });
+
+  // grip runs from the group's origin (where the hand holds it) downward
+  const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.017, 0.017, 0.26, 10), handleMat);
+  handle.position.y = -0.13;
+  group.add(handle);
+
+  // blade continues below the handle
+  const blade = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.5, 0.028), bladeMat);
+  blade.position.y = -0.26 - 0.25;
+  group.add(blade);
+  
+  // Store blade reference for collision detection
+  group.blade = blade;
+  group.bladeHalfHeight = 0.25;  // half of blade height (0.5 / 2)
+  group.bladeHalfWidth = 0.055;  // half of blade width (0.11 / 2)
+
+  group.traverse((n) => { if (n.isMesh) { n.castShadow = true; n.receiveShadow = true; } });
+  return group;
+}
+
+// Finds the striker's right-hand bone and parents a bat to it, scale-
+// compensated for the rig's 0.01 scale. Matches on "righthand" specifically
+// (not "righthandthumb/index/middle/ring/pinky") so it grabs the palm bone,
+// not a finger bone.
+function attachBatToHand(char) {
+  let handBone = null;
+  char.model.traverse((node) => {
+    if (handBone) return;
+    const flat = node.name.toLowerCase().replace(/[^a-z]/g, '');
+    if (flat.endsWith('righthand')) handBone = node;
+  });
+
+  const bat = createCricketBat();
+  bat.scale.setScalar(BAT_SCALE_COMPENSATION);
+
+  if (!handBone) {
+    console.warn('Duel test: no RightHand bone found on the striker rig — bat placed near the model instead of actually held. Check the console log of bone names if this happens.');
+    bat.scale.setScalar(1); // not parented under the scaled rig, so no compensation needed
+    bat.position.set(char.model.position.x + 0.3, 1.0, char.model.position.z);
+    scene.add(bat);
+    return bat;
+  }
+
+  bat.position.copy(BAT_GRIP_LOCAL_POS).add(BAT_GRIP_CORRECTION_POS);
+  bat.rotation.set(
+    BAT_GRIP_LOCAL_ROT.x + BAT_GRIP_CORRECTION_ROT.x,
+    BAT_GRIP_LOCAL_ROT.y + BAT_GRIP_CORRECTION_ROT.y,
+    BAT_GRIP_LOCAL_ROT.z + BAT_GRIP_CORRECTION_ROT.z
+  );
+  handBone.add(bat);
+  return bat;
+}
+
+function deliverBall() {
+  // Solves the vertical launch speed analytically so the ball actually
+  // pitches (touches the ground) at a "good length" spot partway down the
+  // pitch, then bounces on up toward the striker — a real bowling arc
+  // rather than a flat, unrealistic throw.
+  const releasePos = new THREE.Vector3(BOWLER_END_X, 1.9, BOWLER_END_Z);
+  // releasePos.y = 1.9; // roughly release height for an overarm action
+
+  // Aim point: where the ball should actually cross the striker's crease.
+  // Everything else — including the bounce point — is derived from this
+  // one straight line, so the ball can't drift sideways after it pitches.
+  // (Previously the bounce point had its own independent random jitter,
+  // separate from the arrival point, so the same sideways offset applied
+  // twice — once release-to-bounce, once bounce-to-striker — landing the
+  // ball a meter-plus wide of where it looked aimed.)
+  const arrivalX = STRIKER_END_X + (Math.random() - 0.5) * 0.6; // line variation, ball to ball
+  const arrivalZ = STRIKER_END_Z;
+  const totalDx = arrivalX - releasePos.x;
+  const totalDz = arrivalZ - releasePos.z;
+
+  const pitchZ = BOWLER_END_Z + (STRIKER_END_Z - BOWLER_END_Z) * DUEL_GOOD_LENGTH_FRAC;
+  const pitchFrac = totalDz !== 0 ? (pitchZ - releasePos.z) / totalDz : DUEL_GOOD_LENGTH_FRAC;
+  const pitchX = releasePos.x + totalDx * pitchFrac; // bounce point sits on the aim-line, not jittered separately
+
+  const horizDist = Math.max(0.001, Math.hypot(totalDx, totalDz));
+  const pitchDist = Math.max(0.001, Math.hypot(pitchX - releasePos.x, pitchZ - releasePos.z));
+  const t = Math.max(0.05, pitchDist / DUEL_BOWL_PACE);
+  const vy0 = (DUEL_BALL_RADIUS - releasePos.y - 0.5 * DUEL_GRAVITY * t * t) / t;
+
+  DUEL.ballVel.set((totalDx / horizDist) * DUEL_BOWL_PACE, vy0, (totalDz / horizDist) * DUEL_BOWL_PACE);
+  DUEL.ball.position.copy(releasePos);
+  DUEL.ball.visible = true;
+  DUEL.held = false;
+  DUEL.delivered = true;
+  DUEL.targetContactHeight = DUEL_CONTACT_HEIGHT_MIN + Math.random() * (DUEL_CONTACT_HEIGHT_MAX - DUEL_CONTACT_HEIGHT_MIN);
+}
+
+// Debug aid for re-calibrating BAT_GRIP_CORRECTION_POS/ROT after the
+// baseballIdle pose swap shifted the bat's resting position. When on,
+// drops a small red marker at the bat blade's actual world position and
+// a small yellow marker at the ball's position, every frame a swing is
+// live. Compare the two on-screen to see exactly how far off the bat is
+// and in which direction, instead of guessing correction numbers blind.
+const DUEL_DEBUG_BAT_COLLISION = true;
+let _debugBladeMarker = null;
+let _debugBallMarker = null;
+function updateBatCollisionDebugMarkers() {
+  if (!DUEL_DEBUG_BAT_COLLISION) return;
+  const bat = DUEL.striker && DUEL.striker.bat;
+  if (!bat || !bat.blade) return;
+
+  if (!_debugBladeMarker) {
+    _debugBladeMarker = new THREE.Mesh(
+      new THREE.SphereGeometry(0.05, 8, 8),
+      new THREE.MeshBasicMaterial({ color: 0xff0000, depthTest: false })
+    );
+    _debugBladeMarker.renderOrder = 999;
+    scene.add(_debugBladeMarker);
+  }
+  if (!_debugBallMarker) {
+    _debugBallMarker = new THREE.Mesh(
+      new THREE.SphereGeometry(0.05, 8, 8),
+      new THREE.MeshBasicMaterial({ color: 0xffff00, depthTest: false })
+    );
+    _debugBallMarker.renderOrder = 999;
+    scene.add(_debugBallMarker);
+  }
+
+  const bladeWorldPos = new THREE.Vector3();
+  bat.blade.getWorldPosition(bladeWorldPos);
+  _debugBladeMarker.position.copy(bladeWorldPos);
+  _debugBladeMarker.visible = true;
+
+  if (DUEL.ball && DUEL.ball.visible) {
+    _debugBallMarker.position.copy(DUEL.ball.position);
+    _debugBallMarker.visible = true;
+  } else {
+    _debugBallMarker.visible = false;
+  }
+}
+
+function checkBatCollision() {
+  const bat = DUEL.striker.bat;
+  
+  if (!bat) {
+    console.log('DEBUG: DUEL.striker.bat is null');
+    return null;
+  }
+  
+  if (!bat.blade) {
+    console.log('DEBUG: bat exists but bat.blade is null');
+    console.log('DEBUG: bat properties:', Object.keys(bat).slice(0, 10));
+    return null;
+  }
+  
+  // Get bat's world position and rotation
+  const batWorldPos = new THREE.Vector3();
+  bat.getWorldPosition(batWorldPos);
+  const batWorldQuat = new THREE.Quaternion();
+  bat.getWorldQuaternion(batWorldQuat);
+  
+  // Ball position relative to bat
+  const ballRelative = DUEL.ball.position.clone().sub(batWorldPos);
+  
+  // Transform ball position to bat's local space
+  const batLocalQuat = batWorldQuat.clone().invert();
+  ballRelative.applyQuaternion(batLocalQuat);
+  
+  // Check if ball is within blade bounding zone (with margin for ball radius)
+  const margin = DUEL_BALL_RADIUS + 0.2;
+  const bladeY = bat.blade.position.y;
+  const bladeX = bat.blade.position.x;
+  const bladeZ = bat.blade.position.z;
+  
+  // Check bounds - VERY LOOSE for testing
+  const xCheck = Math.abs(ballRelative.x - bladeX);
+  const yCheck = Math.abs(ballRelative.y - bladeY);
+  const zCheck = Math.abs(ballRelative.z - bladeZ);
+  
+  console.log('Collision bounds check:', {
+    xOK: xCheck <= (bat.bladeHalfWidth + margin),
+    yOK: yCheck <= (bat.bladeHalfHeight + margin),
+    zOK: zCheck <= (0.2 + margin),
+    x: xCheck.toFixed(3),
+    y: yCheck.toFixed(3),
+    z: zCheck.toFixed(3)
+  });
+  
+  if (xCheck > bat.bladeHalfWidth + margin ||
+      yCheck > bat.bladeHalfHeight + margin ||
+      zCheck > 0.2 + margin) {
+    return null;
+  }
+  
+  // Calculate contact quality
+  const bladeYNorm = Math.abs(ballRelative.y - bladeY) / bat.bladeHalfHeight;
+  const bladeXNorm = Math.abs(ballRelative.x - bladeX) / bat.bladeHalfWidth;
+  
+  let quality = 'middle';
+  let power = 1.3;
+  
+  if (bladeYNorm > 0.8 || bladeXNorm > 0.85) {
+    quality = 'edge';
+    power = 0.6;
+  } else if (bladeYNorm > 0.6 || bladeXNorm > 0.7) {
+    quality = 'offcenter';
+    power = 1.0;
+  }
+  
+  console.log('Collision detected:', quality);
+  
+  return {
+    quality: quality,
+    power: power,
+    contactY: ballRelative.y,
+    batWorldPos: batWorldPos,
+    batWorldQuat: batWorldQuat
+  };
+}
+
+function hitBall(incomingSpeed, collision) {
+  // Use collision data if available, otherwise default behavior
+  let power = Math.max(14, (incomingSpeed || DUEL_BOWL_PACE) * 1.3);
+  let angle = (Math.random() - 0.5) * Math.PI * 0.8;
+  let verticalPower = 6;
+  
+  if (collision) {
+    if (collision.quality === 'edge') {
+      // EDGE HIT: Very weak, NO collision follow-through, just pops up
+      // Ball barely leaves the crease area - minimal power application
+      const bowlPace = incomingSpeed || DUEL_BOWL_PACE;
+      power = bowlPace * 0.2;  // REDUCED - very weak horizontal power (edge shouldn't carry)
+      angle = (Math.random() - 0.5) * Math.PI * 0.15;  // minimal deflection
+      verticalPower = 16;  // goes VERY HIGH - mostly vertical
+      
+      console.log('EDGE HIT: WEAK power=' + power.toFixed(1) + ', vertical=' + verticalPower + ' (no collision check)');
+      
+    } else if (collision.quality === 'offcenter') {
+      // OFF-CENTER: Normal hit, decent power
+      const bowlPace = incomingSpeed || DUEL_BOWL_PACE;
+      power = bowlPace * 1.1;  // slightly reduced
+      angle = (Math.random() - 0.5) * Math.PI * 0.6;  // normal deflection
+      verticalPower = 7;  // normal bounce
+      
+      console.log('OFFCENTER HIT: normal power=' + power.toFixed(1) + ', vertical=' + verticalPower);
+      
+    } else if (collision.quality === 'middle') {
+      // MIDDLE HIT: MAXIMUM power + BOUNCE force
+      // Good contact = maximum horizontal power + strong bounce force for power shots
+      const bowlPace = incomingSpeed || DUEL_BOWL_PACE;
+      power = bowlPace * 2.4;  // 140% MORE power - EXTRA STRONG
+      angle = (Math.random() - 0.5) * Math.PI * 0.8;  // full deflection
+      verticalPower = 9;  // STRONGER bounce force for middle hits
+      
+      console.log('MIDDLE HIT: MAXIMUM power=' + power.toFixed(1) + ', BOUNCE vertical=' + verticalPower);
+    }
+  }
+  
+  const dirX = Math.sin(angle);
+  const dirZ = -Math.cos(angle);
+  DUEL.ballVel.set(dirX * power, verticalPower, dirZ * power);
+  DUEL.afterHit = true;  // now in the outfield-roll phase
+  DUEL.fielderReactionTimer = FIELDER_REACTION_DELAY;
+}
+
+function resetDelivery() {
+  DUEL.state = 'ready';
+  DUEL.stateTimer = 0;
+  DUEL.delivered = false;
+  DUEL.swung = false;
+  DUEL.committedThisBall = false;
+  DUEL.impactApplied = false;
+  DUEL.bestHitDist = undefined;
+  DUEL.released = false;
+  DUEL.leftBall = false;
+  DUEL.predictedX = undefined;
+  DUEL.afterHit = false;
+  DUEL.ballVel.set(0, 0, 0);
+  DUEL.held = true;
+  DUEL.bowlTimer = null;
+  DUEL.ball.visible = false;
+  DUEL.ball.position.set(0, DUEL_BALL_RADIUS, -30);
+  DUEL.striker.model.position.x = STRIKER_END_X; // back to his guard spot for the next ball
+  DUEL.striker.model.position.y = 0; // undo any crouch/rise nudge from the last delivery
+  DUEL.shuffleTargetX = STRIKER_END_X;
+  DUEL.shuffleTargetY = 0;
+  _duelPlayAction(DUEL.striker, 'baseballIdle');
+  DUEL.fielderReactionTimer = 0;
+  DUEL.returning = false;
+  DUEL.returnComplete = false;
+  DUEL.ballHeldByFielder = false;
+  DUEL.fielderClaim = null; // release the claim so any fielder can react to the next delivery's ball
+  DUEL.returnThrowStart = null;
+  DUEL.returnThrowTarget = null;
+  DUEL.returnThrowDuration = 0;
+  DUEL.returnThrowElapsed = 0;
+  for (const f of FIELDERS) {
+    f.chaseState = 'base';
+    f.pickupTimer = 0;
+    f.throwTimer = 0;
+    f.thrown = false;
+    f.model.position.set(f.home.x, 0, f.home.z);
+    f.model.rotation.y = Math.atan2(-f.home.x, -f.home.z); // same "face the pitch centre" convention as spawnFielder
+    _duelPlayAction(f, 'idle');
+  }
+}
+
+function updateDuel(dt) {
+  if (!DUEL.striker || !DUEL.ball) return;
+  DUEL.stateTimer += dt;
+
+  // ---- ball physics, only while it's actually in the air/on the ground (not held) ----
+  // Also gated off while a fielder's got hold of it (ballHeldByFielder,
+  // during the pickup pause + throw wind-up) or while it's mid-return-throw
+  // (returning, handled by its own simpler physics in updateReturnThrow) —
+  // this block's bounce solve is tuned specifically for the bowler-to-
+  // striker delivery arc and would fight both of those.
+  if (DUEL.delivered && !DUEL.held && !DUEL.ballHeldByFielder && !DUEL.returning) {
+    const v = DUEL.ballVel;
+    v.y += DUEL_GRAVITY * dt;
+    DUEL.ball.position.x += v.x * dt;
+    DUEL.ball.position.y += v.y * dt;
+    DUEL.ball.position.z += v.z * dt;
+
+    // Wall collision: if ball hits stadium wall, bounce gently back (minimal force)
+    const ballRadius = Math.hypot(DUEL.ball.position.x, DUEL.ball.position.z);
+    if (ballRadius > STADIUM_WALL_R - 0.5) {
+      // Ball hit the stadium wall/advertising board area
+      const wallDist = ballRadius - (STADIUM_WALL_R - 0.5);
+      if (wallDist > 0) {
+        // Push ball back inward gently
+        const angle = Math.atan2(DUEL.ball.position.z, DUEL.ball.position.x);
+        DUEL.ball.position.x = (STADIUM_WALL_R - 0.5) * Math.cos(angle);
+        DUEL.ball.position.z = (STADIUM_WALL_R - 0.5) * Math.sin(angle);
+        
+        // Reverse radial velocity only (minimal bounce), reduce significantly
+        const radialVel = v.x * Math.cos(angle) + v.z * Math.sin(angle);
+        if (radialVel > 0) {
+          // Ball moving outward, bounce it back with very small force
+          v.x -= radialVel * 0.3 * Math.cos(angle);  // 30% reverse (not 100%)
+          v.z -= radialVel * 0.3 * Math.sin(angle);
+        }
+      }
+    }
+
+    const groundHeight = groundHeightAt(DUEL.ball.position.x, DUEL.ball.position.z) + DUEL_BALL_RADIUS;
+    if (DUEL.ball.position.y <= groundHeight) {
+      DUEL.ball.position.y = groundHeight;
+      if (v.y < 0) {
+        // Instead of a flat restitution ratio (which left the ball barely
+        // off the turf — low enough that it bounced a second time before
+        // ever reaching the striker), solve for the exact upward speed
+        // that carries it to a hittable height right as it arrives at the
+        // striker's crease.
+        const remaining = STRIKER_END_Z - DUEL.ball.position.z;
+        const t2 = v.z > 0.05 ? remaining / v.z : -1;
+        if (t2 > 0.05) {
+          const targetH = DUEL.targetContactHeight || 0.85;
+          let vyBounce = (targetH - groundHeight - 0.5 * DUEL_GRAVITY * t2 * t2) / t2;
+          v.y = Math.max(1.5, Math.min(12, vyBounce));
+        } else {
+          v.y = -v.y * DUEL_BOUNCE_RESTITUTION; // already past/level with striker — just a normal bounce
+        }
+      }
+      // Rolling friction: this only ever damped the vertical bounce above —
+      // horizontal speed (v.x/v.z) was never touched once grounded, so a hit
+      // ball just skated across the outfield at constant speed forever
+      // instead of rolling out and stopping like a real struck ball. Only
+      // applies once DUEL.afterHit is true (see hitBall) — the bowler's own
+      // pitch-bounce on the way to the striker must NOT be damped here, or
+      // it'd bleed off pace before arrival and throw out the swing-timing
+      // math in the 'inFlight' branch below, which assumes ~constant vz.
+      // Applied as an exponential decay so it's frame-rate independent (same
+      // slowdown whether dt is small or the clamped 0.05 worst case), then
+      // snapped to exactly zero once it's crawling slowly enough that the
+      // asymptote would otherwise never actually finish — that snap is also
+      // what lets the "stopped" check below ever become true on its own,
+      // instead of a hit only ever ending via the wayPast distance cutoff.
+      if (DUEL.afterHit) {
+        // Apply friction - but EDGE hits stop faster, MIDDLE hits roll further
+        let frictionMultiplier = 1.0;  // default
+        
+        // Check what kind of hit this was by looking at ball velocity
+        const speed = Math.hypot(v.x, v.z);
+        if (speed < 5) {
+          // EDGE hit - stops quickly (weak hit)
+          frictionMultiplier = 1.5;  // 50% more friction
+        } else if (speed > 25) {
+          // MIDDLE hit - rolls far (strong hit)
+          frictionMultiplier = 0.7;  // 30% less friction
+        }
+        
+        const groundFrictionDecay = Math.pow(0.06 * frictionMultiplier, dt);
+        v.x *= groundFrictionDecay;
+        v.z *= groundFrictionDecay;
+        if (v.x * v.x + v.z * v.z < 0.04) { v.x = 0; v.z = 0; }
+      }
+    }
+    if (v.lengthSq() > 0.01) DUEL.ball.rotation.x += v.z * dt * 2; // visual roll/spin only
+  }
+
+  // Mixers update here (rather than at the very end) so bone transforms —
+  // and therefore the bat's world position — are current for this same
+  // frame's impact check below, not one frame stale.
+  DUEL.striker.mixer.update(dt);
+  if (DUEL.bowler) DUEL.bowler.mixer.update(dt);
+  for (const f of FIELDERS) f.mixer.update(dt);
+
+  // Auto-deliver the ball without bowler animation
+  if (DUEL.bowlTimer !== null) {
+    DUEL.bowlTimer += dt;
+    const bowlDuration = 0.5; // simplified delivery time
+    if (!DUEL.released && DUEL.bowlTimer >= bowlDuration * DUEL_RELEASE_FRAC) {
+      DUEL.released = true;
+      deliverBall();
+      DUEL.state = 'inFlight';
+      DUEL.stateTimer = 0;
+    }
+    if (DUEL.bowlTimer >= bowlDuration) {
+      DUEL.bowlTimer = null;
+    }
+  }
+
+  if (DUEL.state === 'ready') {
+    if (DUEL.stateTimer >= DUEL_PAUSE_BEFORE_BOWL) {
+      DUEL.state = 'bowling';
+      DUEL.stateTimer = 0;
+      DUEL.bowlTimer = 0;
+      // Auto-deliver without animation
+    }
+  } else if (DUEL.state === 'inFlight') {
+    if (!DUEL.committedThisBall) {
+      const remaining = DUEL_CONTACT_Z - DUEL.ball.position.z;
+      const vz = DUEL.ballVel.z;
+
+      // Track exactly where the ball is going to cross the striker's line —
+      // refreshed every frame right up until the swing actually triggers.
+      // This just updates the TARGET; the actual easing toward it happens
+      // once, unconditionally, at the bottom of this whole 'inFlight'
+      // branch (see below) so the same code also carries the striker back
+      // to his guard spot once the swing/leave is done, instead of only
+      // running while still deciding.
+      // predictedX is kept UNCLAMPED and stored on DUEL so the reach check
+      // below can compare against where the ball is actually going, not
+      // against the clamped spot the striker's feet can physically reach —
+      // those are two different questions (can I get my feet there vs. can
+      // I get the bat there) and conflating them was the bug: a truly wide
+      // ball would still pass a reach check that only ever looked at the
+      // already-clamped shuffle target.
+      if (vz > 0.05 && remaining > 0) {
+        const timeToLine = remaining / vz;
+        const predictedX = DUEL.ball.position.x + DUEL.ballVel.x * timeToLine;
+        DUEL.predictedX = predictedX;
+        DUEL.shuffleTargetX = Math.max(
+          STRIKER_END_X - DUEL_STRIKER_SHUFFLE_MAX,
+          Math.min(STRIKER_END_X + DUEL_STRIKER_SHUFFLE_MAX, predictedX)
+        );
+      }
+
+      // Vertical counterpart to the shuffle above: the ball's arrival
+      // height is already known ahead of time (the bounce physics solves
+      // for DUEL.targetContactHeight directly — see the bounce block in
+      // the ball-physics section), so nudge the striker's root up or down
+      // a small amount toward it — a slight crouch for a low one, a
+      // slight rise for a bouncer — instead of always swinging from a
+      // fixed standing height regardless of where the ball's actually
+      // arriving.
+      const targetHeight = DUEL.targetContactHeight || DUEL_BAT_NATURAL_HEIGHT;
+      DUEL.shuffleTargetY = Math.max(
+        -DUEL_STRIKER_VSHUFFLE_MAX,
+        Math.min(DUEL_STRIKER_VSHUFFLE_MAX, targetHeight - DUEL_BAT_NATURAL_HEIGHT)
+      );
+
+      // Real "read the bowling" timing: instead of always starting the
+      // swing a fixed time before arrival, work out exactly how long
+      // the ball still needs (its current speed — which already reflects
+      // the bowler's pace off this particular delivery — divided into the
+      // remaining distance, which reflects where it pitched/how far down
+      // the "length" it already travelled) and start the swing so the
+      // clip's own bat-meets-ball frame lines up with that arrival time.
+      const eta = vz > 0.05 ? remaining / vz : Infinity;
+      const swingClip = DUEL.striker.actions.baseballStrike.getClip();
+      const swingLeadNeeded = swingClip.duration * DUEL_SWING_IMPACT_FRAC;
+
+      // The commit point used to be timed purely off the swing animation's
+      // own lead time, which assumes the striker's feet are already where
+      // they need to be. On a ball that needs real footwork (wide of his
+      // current spot) that's not true yet — so also work out how long the
+      // shuffle itself still needs, and commit whichever comes first,
+      // animation lead or travel time. That way a wide-but-reachable ball
+      // gets decided on early enough for the feet to actually arrive before
+      // the bat swings, instead of swinging from wherever he happens to be
+      // standing at the animation-only deadline.
+      const xTarget = DUEL.predictedX !== undefined ? DUEL.predictedX : STRIKER_END_X;
+      const moveTimeNeeded = Math.abs(xTarget - DUEL.striker.model.position.x) / DUEL_STRIKER_SHUFFLE_SPEED;
+      const leadNeeded = Math.max(swingLeadNeeded, moveTimeNeeded) + DUEL_SWING_EXTRA_LEAD;
+
+      if (eta <= leadNeeded) {
+        // Always swing once committed — no leaving a ball because it's
+        // technically outside some reach zone. Every delivery this bowler
+        // throws lands within the height/line range set up in deliverBall,
+        // so there's no such thing as a "genuinely unreachable" ball here;
+        // he takes a swing at every single one.
+        DUEL.committedThisBall = true;
+        DUEL.leftBall = false;
+        DUEL.swingTimer = 0;
+        DUEL.impactApplied = false;
+        DUEL.swung = true;
+        _duelPlayAction(DUEL.striker, 'baseballStrike');
+      }
+    } else if (!DUEL.leftBall) {
+      DUEL.swingTimer += dt;
+      const swingClip = DUEL.striker.actions.baseballStrike.getClip();
+
+      // Contact is no longer decided by measuring distance to the bat
+      // mesh's animated world position. That position depends on
+      // BAT_GRIP_LOCAL_POS/ROT, which is an uncalibrated guess (see the
+      // comment where it's defined) — so that check could fail every time
+      // regardless of how correct the timing/footwork logic was, which is
+      // exactly what was happening. Instead: while a swing is in progress
+      // and hasn't connected yet, the instant the ball reaches the
+      // striker's batting line, it's a hit. He already committed to this
+      // swing (every ball gets one now), so there's nothing left to
+      // adjudicate — connect it.
+      if (!DUEL.impactApplied && DUEL.ball.position.z >= DUEL_CONTACT_Z) {
+        DUEL.impactApplied = true;
+        const incomingSpeed = DUEL.ballVel.length();
+        
+        console.log('HIT TRIGGERED - checking collision...');
+        const collision = checkBatCollision();
+        
+        let qualityLabel = 'middle';
+        let powerMult = 1.3;
+        let hitCollision = collision;
+        
+        if (collision) {
+          console.log('Ball hit: ' + collision.quality + ' (power: ' + (collision.power * 100).toFixed(0) + '%)');
+          qualityLabel = collision.quality;
+          
+          // Set power multiplier for label - UPDATED with new force system
+          if (collision.quality === 'edge') {
+            powerMult = 0.2;  // REDUCED - edge hits are weak now
+          } else if (collision.quality === 'offcenter') {
+            powerMult = 1.1;
+          } else if (collision.quality === 'middle') {
+            powerMult = 2.4;  // INCREASED - middle hits have EXTRA power + bounce
+          }
+        } else {
+          // No collision detected - pick random quality (with new force multipliers)
+          const rand = Math.random();
+          if (rand < 0.33) {
+            qualityLabel = 'edge';
+            powerMult = 0.2;  // REDUCED - edge hits are weak
+            hitCollision = { quality: 'edge', power: 0.2 };
+          } else if (rand < 0.66) {
+            qualityLabel = 'offcenter';
+            powerMult = 1.1;
+            hitCollision = { quality: 'offcenter', power: 1.1 };
+          } else {
+            qualityLabel = 'middle';
+            powerMult = 2.4;  // INCREASED - middle hits have EXTRA power + bounce
+            hitCollision = { quality: 'middle', power: 2.4 };
+          }
+          console.log('No collision - random hit: ' + qualityLabel + ' (' + (powerMult * 100).toFixed(0) + '%)');
+        }
+        
+        // Warp the ball onto the bat's actual mesh position before firing
+        // it off. Up to now the ball stayed on its own incoming flight
+        // line and only had its velocity flipped, so it left from wherever
+        // it happened to be on that arc — which usually wasn't anywhere
+        // near where the bat model actually was, hence the "hit connects
+        // but looks like it came out of thin air" look. Snapping it onto
+        // the bat blade (or a sensible fallback point on the bat/hand if
+        // the blade can't be read) guarantees the ball visually leaves
+        // from contact every time, regardless of any small drift between
+        // the swing animation and the grip offset.
+        const bat = DUEL.striker.bat;
+        if (bat) {
+          const contactPoint = new THREE.Vector3();
+          if (bat.blade) {
+            bat.blade.getWorldPosition(contactPoint);
+          } else {
+            bat.getWorldPosition(contactPoint);
+          }
+          DUEL.ball.position.copy(contactPoint);
+        }
+        
+        createHitQualityLabel(qualityLabel, powerMult);
+        hitBall(incomingSpeed, hitCollision);
+      }
+      if (DUEL.swingTimer >= swingClip.duration) {
+        DUEL.swung = false;  // reset swing flag immediately when animation finishes
+        // Stop the swing action and play idle
+        if (DUEL.striker.actions.swing) {
+          DUEL.striker.actions.swing.stop();
+        }
+        _duelPlayAction(DUEL.striker, 'baseballIdle');
+        // Ease back to the guard spot now that the swing's done, instead
+        // of staying frozen in the crouch/shuffle pose until resetDelivery
+        // hard-snaps it later.
+        DUEL.shuffleTargetX = STRIKER_END_X;
+        DUEL.shuffleTargetY = 0;
+      }
+    }
+
+    // Ease the striker's root toward wherever shuffleTargetX/Y currently
+    // point, every single frame this state is active — regardless of
+    // whether we're still deciding, mid-swing, or already done. That's
+    // what makes him glide back to his guard spot right after the swing
+    // or a leave, instead of sitting stuck in the offset pose until the
+    // next delivery's hard reset.
+    const moveStep = DUEL_STRIKER_SHUFFLE_SPEED * dt;
+    const dxMove = DUEL.shuffleTargetX - DUEL.striker.model.position.x;
+    if (Math.abs(dxMove) <= moveStep) {
+      DUEL.striker.model.position.x = DUEL.shuffleTargetX;
+    } else {
+      DUEL.striker.model.position.x += Math.sign(dxMove) * moveStep;
+    }
+    const vMoveStep = DUEL_STRIKER_VSHUFFLE_SPEED * dt;
+    const dyMove = DUEL.shuffleTargetY - DUEL.striker.model.position.y;
+    if (Math.abs(dyMove) <= vMoveStep) {
+      DUEL.striker.model.position.y = DUEL.shuffleTargetY;
+    } else {
+      DUEL.striker.model.position.y += Math.sign(dyMove) * vMoveStep;
+    }
+
+    const groundHeight = groundHeightAt(DUEL.ball.position.x, DUEL.ball.position.z) + DUEL_BALL_RADIUS;
+    const stopped = DUEL.ballVel.lengthSq() < 0.05 && DUEL.ball.position.y <= groundHeight + 0.01;
+    
+    // Check if ball hit dugout roof or went out of stadium
+    const ballRadius = Math.hypot(DUEL.ball.position.x, DUEL.ball.position.z);
+    const hitDugoutRoof = DUEL.ball.position.x > DUGOUT_MIN_X && DUEL.ball.position.x < DUGOUT_MAX_X && 
+                          DUEL.ball.position.z > DUGOUT_MIN_Z && DUEL.ball.position.z < DUGOUT_MAX_Z &&
+                          DUEL.ball.position.y > DUGOUT_ROOF_Y;
+    const outOfStadium = ballRadius > STADIUM_EDGE_R;
+    
+    const wayPast = hitDugoutRoof || outOfStadium || DUEL.ball.position.z > STRIKER_END_Z + 15 || Math.abs(DUEL.ball.position.x) > 40;
+    if (stopped || wayPast) {
+      DUEL.state = 'resolved';
+      DUEL.stateTimer = 0;
+    }
+  } else if (DUEL.state === 'resolved') {
+    // Gated on the full chase/pickup/throw/collect loop finishing
+    // (DUEL.returnComplete, set by updateReturnThrow once the bowler
+    // collects the ball) rather than a flat timer from the moment the hit
+    // ball first stopped — otherwise the reset could fire mid-chase and cut
+    // a fielder's run/throw off.
+    if (DUEL.returnComplete) {
+      if (DUEL.stateTimer >= DUEL_RESET_DELAY) resetDelivery();
+    } else if (DUEL.stateTimer >= DUEL_RESOLVED_WATCHDOG_TIMEOUT) {
+      // Watchdog: the loop above never actually finished — nobody ever
+      // chased the ball down (it stopped outside every fielder's
+      // FIELDER_REACTION_RADIUS), a fielder got stuck mid-chase, or a
+      // return throw missed the bowler and rolled to a stop just outside
+      // pickup range. Force the next delivery instead of hanging here.
+      console.warn('Fielding watchdog: forcing reset after ' + DUEL_RESOLVED_WATCHDOG_TIMEOUT + 's without a completed return-and-collect.');
+      resetDelivery();
+    }
+  }
+
+}
+
+function initDuelCharacters(loader) {
+  DUEL.striker = spawnDuelCharacter(loader, STRIKER_END_X, STRIKER_END_Z, STRIKER_FACING_YAW);
+  if (!DUEL.striker) {
+    console.error('Duel test: failed to spawn striker instance.');
+    return;
+  }
+  
+  DUEL.bowler = spawnDuelCharacter(loader, BOWLER_END_X, BOWLER_END_Z, BOWLER_FACING_YAW);
+  if (!DUEL.bowler) {
+    console.error('Duel test: failed to spawn bowler instance.');
+    return;
+  }
+  
+  DUEL.striker.bat = attachBatToHand(DUEL.striker);
+
+  DUEL.ball = createFetchBall(); // same ball geometry/material as the fetch-chaser above
+  DUEL.ball.visible = false;
+  DUEL.ball.position.set(STRIKER_END_X, DUEL_BALL_RADIUS, STRIKER_END_Z + 0.3);
+  scene.add(DUEL.ball);
+
+  _duelPlayAction(DUEL.striker, 'baseballIdle');
+  _duelPlayAction(DUEL.bowler, 'idle');
+
+  FIELDERS = FIELDER_SPAWN_SPOTS
+    .map((spot) => spawnFielder(loader, spot))
+    .filter((f) => f !== null);
+  for (const f of FIELDERS) _duelPlayAction(f, 'idle');
+  console.log('Fielder spawn: ' + FIELDERS.length + '/' + FIELDER_SPAWN_SPOTS.length + ' fielders on the field.');
+
+  console.log('Duel test: striker at (' + STRIKER_END_X.toFixed(2) + ',' + STRIKER_END_Z.toFixed(2) + ').');
+}
+
+async function initFBXTestCharacter() {
+  _fbxTestHud.textContent = 'FBX test: loading fflate.min.js…';
+  const fflateOk = await _fbxLoadFirstWorking([
+    'https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/libs/fflate.min.js',
+    'https://unpkg.com/three@0.128.0/examples/js/libs/fflate.min.js'
+  ], 'fflate.min.js');
+  if (!fflateOk) {
+    console.warn('FBX test: could not load fflate.min.js from any mirror — continuing anyway, these files likely do not need it.');
+  }
+
+  _fbxTestHud.textContent = 'FBX test: loading FBXLoader.js…';
+  const fbxLoaderOk = await _fbxLoadFirstWorking([
+    'https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/FBXLoader.js',
+    'https://unpkg.com/three@0.128.0/examples/js/loaders/FBXLoader.js'
+  ], 'FBXLoader.js');
+  if (!fbxLoaderOk) {
+    console.error('FBX test: could not load FBXLoader.js from any CDN mirror. Check your network settings / ad blocker.');
+    _fbxTestHud.textContent = 'FBX test: FAILED — could not load FBXLoader.js from any CDN.';
+    return;
+  }
+
+  _fbxTestHud.textContent = 'FBX test: loading SkeletonUtils.js…';
+  const skelUtilsOk = await _fbxLoadFirstWorking([
+    'https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/utils/SkeletonUtils.js',
+    'https://unpkg.com/three@0.128.0/examples/js/utils/SkeletonUtils.js'
+  ], 'SkeletonUtils.js');
+  if (!skelUtilsOk) {
+    console.error('FBX test: could not load SkeletonUtils.js from any CDN mirror. Check your network settings / ad blocker.');
+    _fbxTestHud.textContent = 'FBX test: FAILED — could not load SkeletonUtils.js from any CDN.';
+    return;
+  }
+
+  _fbxTestHud.textContent = 'FBX test: loading character + clips from assets/animations/…';
+  await runFBXTestCharacter();
+}
+
+initFBXTestCharacter();
+
+// ---------- Animation loop ----------
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+
+  updateDuel(dt);
+  updateBatCollisionDebugMarkers();
+  updateFielderAI(dt);
+  updateReturnThrow(dt);
+  updateHitLabels(dt);
+  _fbxTestUpdateHud();
+
+  if (!isTouch) updateKeyMove();
+
+  camera.rotation.order = 'YXZ';
+  camera.rotation.y = yaw;
+  camera.rotation.x = pitch;
+
+  const len = Math.hypot(move.forward, move.right);
+  let fMove = move.forward, rMove = move.right;
+  if (len > 1) { fMove /= len; rMove /= len; }
+
+  const speed = WALK_SPEED * (running ? RUN_MULT : 1);
+  const forwardDir = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+  const rightDir = new THREE.Vector3(Math.sin(yaw + Math.PI/2), 0, Math.cos(yaw + Math.PI/2));
+
+  velocity.set(0,0,0);
+  velocity.addScaledVector(forwardDir, fMove * speed);
+  velocity.addScaledVector(rightDir, rMove * speed);
+
+  camera.position.x += velocity.x * dt;
+  camera.position.z += velocity.z * dt;
+  camera.position.y = EYE_HEIGHT;
+
+  // keep inside the world bounds (grass extends beneath/around the stadium)
+  const half = WORLD_SIZE/2 - 5;
+  camera.position.x = Math.max(-half, Math.min(half, camera.position.x));
+  camera.position.z = Math.max(-half, Math.min(half, camera.position.z));
+
+  // Resolve collisions with stadium walls and dugout
+  resolvePlayerStadiumWallCollision(camera.position, PLAYER_COLLISION_RADIUS);
+  resolveDugoutCollision(camera.position);
+
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>
